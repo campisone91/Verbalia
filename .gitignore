@@ -45,13 +45,29 @@ data/*
 !data/.gitkeep
 settings.json
 
-# Sensitive artifacts
+# Sensitive artifacts and media
 *.wav
 *.mp3
 *.m4a
 *.flac
 *.ogg
+*.aac
+*.wma
+*.opus
 *.docx
+*.doc
+*.pdf
+
+# Databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Secrets and environment
+.env
+.env.*
+!.env.example
 
 state.json
 state.json.tmp
