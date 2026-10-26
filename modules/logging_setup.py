@@ -200,7 +200,7 @@ def configure_logging(
 
 
 def get_logger(name: str | None = None) -> logging.Logger:
-    """Restituisce il logger principale o un child logger sotto 'teams_meeting_scribe'."""
+    """Restituisce il logger principale o un child logger sotto 'Verbalia'."""
     base_logger = logging.getLogger(LOGGER_NAME)
     if _SESSION_FILTER not in base_logger.filters:
         base_logger.addFilter(_SESSION_FILTER)

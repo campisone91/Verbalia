@@ -46,26 +46,78 @@ def _spec(
 @dataclass(frozen=True, slots=True)
 class DetectionSettings:
     start_debounce_sec: int = field(
-        default=20, metadata=_spec("Debounce avvio (s)", minimum=0, maximum=300)
+        default=20,
+        metadata=_spec(
+            "Debounce avvio (s)",
+            minimum=0,
+            maximum=300,
+            help_text=(
+                "Secondi di chiamata continua prima di avviare la registrazione. "
+                "Aumentare evita avvii errati per chiamate lampo; ridurre avvia la registrazione più tempestivamente."
+            ),
+        ),
     )
     stop_grace_period_sec: int = field(
-        default=90, metadata=_spec("Grace period chiusura (s)", minimum=0, maximum=1800)
+        default=90,
+        metadata=_spec(
+            "Grace period chiusura (s)",
+            minimum=0,
+            maximum=1800,
+            help_text=(
+                "Attesa in secondi prima di chiudere la sessione a fine call. "
+                "Aumentare protegge da cadute di linea o riavvii di Teams; ridurre genera subito il verbale a fine riunione."
+            ),
+        ),
     )
     outlook_match_tolerance_min: int = field(
-        default=10, metadata=_spec("Tolleranza abbinamento Outlook (min)", minimum=0, maximum=60)
+        default=10,
+        metadata=_spec(
+            "Tolleranza abbinamento Outlook (min)",
+            minimum=0,
+            maximum=60,
+            help_text=(
+                "Finestra in minuti rispetto all'orario per associare l'evento del calendario Outlook. "
+                "Aumentare trova la call anche con anticipo o ritardo; ridurre evita scambi tra meeting consecutivi."
+            ),
+        ),
     )
     use_mic_signal: bool = field(
-        default=True, metadata=_spec("Usa segnale microfono in uso da Teams")
+        default=True,
+        metadata=_spec(
+            "Usa segnale microfono in uso da Teams",
+            help_text=(
+                "Rileva l'uso effettivo del microfono da parte di Teams tramite API Windows. "
+                "Attivo evita registrazioni a vuoto (es. Teams aperto inattivo); disattivare solo se il microfono non viene rilevato."
+            ),
+        ),
     )
 
 
 @dataclass(frozen=True, slots=True)
 class AudioSettings:
     chunk_duration_sec: int = field(
-        default=900, metadata=_spec("Durata chunk audio (s)", minimum=60, maximum=3600)
+        default=900,
+        metadata=_spec(
+            "Durata chunk audio (s)",
+            minimum=60,
+            maximum=3600,
+            help_text=(
+                "Durata in secondi dei segmenti audio registrati e trascritti. "
+                "Ridurre anticipa la trascrizione progressiva e snellisce la fine call; aumentare riduce il numero di file temporanei generati."
+            ),
+        ),
     )
     max_session_duration_sec: int = field(
-        default=14400, metadata=_spec("Durata massima registrazione (s)", minimum=600, maximum=43200)
+        default=14400,
+        metadata=_spec(
+            "Durata massima registrazione (s)",
+            minimum=600,
+            maximum=43200,
+            help_text=(
+                "Limite massimo di sicurezza per una singola registrazione continua. "
+                "Aumentare consente lunghe sessioni senza interruzioni; ridurre previene file enormi in caso di call dimenticate aperte."
+            ),
+        ),
     )
 
 
@@ -73,30 +125,122 @@ class AudioSettings:
 class WhisperSettings:
     model: str = field(
         default="medium",
-        metadata=_spec("Modello Whisper (CPU)", choices=WHISPER_MODEL_CHOICES, restart=True),
+        metadata=_spec(
+            "Modello Whisper (CPU)",
+            choices=WHISPER_MODEL_CHOICES,
+            restart=True,
+            help_text=(
+                "Modello faster-whisper per trascrizione su CPU. "
+                "'large' massimizza l'accuratezza con gergo o audio disturbato ma è più lento; 'small' o 'large-v3-turbo' velocizzano la trascrizione."
+            ),
+        ),
     )
     cpu_threads: int = field(
-        default=6, metadata=_spec("Thread CPU Whisper", minimum=1, maximum=32, restart=True)
+        default=6,
+        metadata=_spec(
+            "Thread CPU Whisper",
+            minimum=1,
+            maximum=32,
+            restart=True,
+            help_text=(
+                "Thread CPU dedicati a faster-whisper. "
+                "Aumentare velocizza la trascrizione su CPU multi-core; ridurre lascia il processore più libero e reattivo per le altre applicazioni in uso."
+            ),
+        ),
     )
-    beam_size: int = field(default=5, metadata=_spec("Beam size", minimum=1, maximum=10))
-    language: str = field(default="it", metadata=_spec("Lingua"))
+    beam_size: int = field(
+        default=5,
+        metadata=_spec(
+            "Beam size",
+            minimum=1,
+            maximum=10,
+            help_text=(
+                "Ampiezza della ricerca per fascio nella decodifica audio. "
+                "Valori alti (5-10) aumentano la fedeltà su passaggi complessi ma rallentano; valori bassi (1-2) sono più rapidi."
+            ),
+        ),
+    )
+    language: str = field(
+        default="it",
+        metadata=_spec(
+            "Lingua",
+            help_text=(
+                "Codice lingua principale dell'audio (es. 'it', 'en'). "
+                "Fissare 'it' previene allucinazioni su silenzi e rumori; modificare solo per riunioni svolte in un'altra lingua."
+            ),
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
 class OllamaSettings:
-    base_url: str = field(default="http://localhost:11434", metadata=_spec("URL Ollama"))
-    model: str = field(default="llama3.1:8b", metadata=_spec("Modello LLM"))
+    base_url: str = field(
+        default="http://localhost:11434",
+        metadata=_spec(
+            "URL Ollama",
+            help_text=(
+                "Indirizzo del server Ollama. "
+                "Modificare se Ollama è in ascolto su un'altra porta o su una macchina remota con GPU dedicata; se non raggiungibile la sintesi fallisce."
+            ),
+        ),
+    )
+    model: str = field(
+        default="llama3.1:8b",
+        metadata=_spec(
+            "Modello LLM",
+            help_text=(
+                "Nome del modello LLM per sintesi e verbale. "
+                "Modelli più capaci offrono resoconti migliori ma richiedono più VRAM e tempo; il modello deve essere già scaricato in Ollama."
+            ),
+        ),
+    )
     num_ctx: int = field(
-        default=16384, metadata=_spec("Contesto (num_ctx)", minimum=4096, maximum=131072)
+        default=16384,
+        metadata=_spec(
+            "Contesto (num_ctx)",
+            minimum=4096,
+            maximum=131072,
+            help_text=(
+                "Dimensione della finestra di contesto in token. "
+                "Aumentare consente di processare trascrizioni più estese senza tagli; ridurre diminuisce l'uso di memoria VRAM della GPU."
+            ),
+        ),
     )
     num_predict_map: int = field(
-        default=3072, metadata=_spec("Token massimi per blocco MAP", minimum=256, maximum=16384)
+        default=3072,
+        metadata=_spec(
+            "Token massimi per blocco MAP",
+            minimum=256,
+            maximum=16384,
+            help_text=(
+                "Token massimi per ogni sintesi parziale (fase MAP). "
+                "Aumentare permette note intermedie più dettagliate e ricche per ogni segmento; ridurre velocizza i passaggi parziali."
+            ),
+        ),
     )
     num_predict_reduce: int = field(
-        default=4096, metadata=_spec("Token massimi REDUCE", minimum=256, maximum=16384)
+        default=4096,
+        metadata=_spec(
+            "Token massimi REDUCE",
+            minimum=256,
+            maximum=16384,
+            help_text=(
+                "Token massimi per il verbale finale e l'email (fase REDUCE). "
+                "Aumentare evita troncamenti in riunioni fitte di decisioni e compiti; ridurre velocizza la stesura e accorcia il testo."
+            ),
+        ),
     )
     temperature: float = field(
-        default=0.2, metadata=_spec("Temperature", minimum=0.0, maximum=2.0)
+        default=0.2,
+        metadata=_spec(
+            "Temperature",
+            minimum=0.0,
+            maximum=2.0,
+            help_text=(
+                "Creatività del modello (0.0 - 2.0). "
+                "Valori bassi (0.0-0.2) garantiscono fedeltà e risposte conformi al trascritto; valori alti aumentano la varietà ma rischiano invenzioni."
+            ),
+        ),
     )
     read_timeout_sec: int = field(
         default=300,
@@ -104,15 +248,44 @@ class OllamaSettings:
             "Timeout tra due chunk di risposta (s)",
             minimum=30,
             maximum=3600,
+            help_text=(
+                "Secondi massimi di attesa tra frammenti generati da Ollama. "
+                "Aumentare previene timeout su GPU/CPU lente o prompt molto lunghi; ridurre rileva prima blocchi del server."
+            ),
         ),
     )
-    keep_alive: str = field(default="10m", metadata=_spec("Keep alive modello"))
+    keep_alive: str = field(
+        default="10m",
+        metadata=_spec(
+            "Keep alive modello",
+            help_text=(
+                "Permanenza del modello in memoria GPU dopo l'uso (es. '10m', '1h', '0' per scaricarlo subito). "
+                "Valori alti velocizzano le call successive; '0' libera subito la VRAM."
+            ),
+        ),
+    )
     map_block_duration_sec: int = field(
-        default=600, metadata=_spec("Durata blocco MAP (s)", minimum=120, maximum=3600)
+        default=600,
+        metadata=_spec(
+            "Durata blocco MAP (s)",
+            minimum=120,
+            maximum=3600,
+            help_text=(
+                "Durata in secondi delle porzioni di trascrizione riassunte singolarmente. "
+                "Ridurre aumenta il dettaglio cronologico moltiplicando i passaggi; aumentare accelera la sintesi complessiva."
+            ),
+        ),
     )
     detail_level: str = field(
         default="dettagliato",
-        metadata=_spec("Livello di dettaglio del resoconto", choices=DETAIL_LEVEL_CHOICES),
+        metadata=_spec(
+            "Livello di dettaglio del resoconto",
+            choices=DETAIL_LEVEL_CHOICES,
+            help_text=(
+                "Profondità del verbale. "
+                "'standard' per recap sintetico e decisioni chiave; 'dettagliato' per discussioni e task operativi; 'massimo' per verbalizzazione completa e analitica."
+            ),
+        ),
     )
 
 
@@ -123,21 +296,50 @@ class OutputSettings:
         metadata=_spec(
             "Cartella output (vuoto = predefinita)",
             restart=True,
-            help_text="Cartella in cui vengono salvati i verbali Word.",
+            help_text=(
+                "Cartella in cui salvare i documenti Word (.docx). "
+                "Se vuoto usa la cartella 'output' del programma; impostare per salvare direttamente su OneDrive o cartelle condivise."
+            ),
         ),
     )
-    organize_by_day: bool = field(default=True, metadata=_spec("Organizza per giorno"))
+    organize_by_day: bool = field(
+        default=True,
+        metadata=_spec(
+            "Organizza per giorno",
+            help_text=(
+                "Raggruppa i documenti in sottocartelle con la data del giorno (YYYY-MM-DD). "
+                "Attivo mantiene l'archivio ordinato; disattivato salva tutti i file nella radice di output."
+            ),
+        ),
+    )
     include_transcript: bool = field(
-        default=True, metadata=_spec("Trascrizione integrale in appendice")
+        default=True,
+        metadata=_spec(
+            "Trascrizione integrale in appendice",
+            help_text=(
+                "Include la trascrizione integrale con timestamp in appendice al documento Word. "
+                "Attivo permette verifiche puntuali; disattivato produce un verbale più compatto e corto."
+            ),
+        ),
     )
     user_display_name: str = field(
-        default="", metadata=_spec("Nome utente per la traccia IO")
+        default="",
+        metadata=_spec(
+            "Nome utente per la traccia IO",
+            help_text=(
+                "Nome da associare al proprio microfono. "
+                "Sostituisce l'etichetta generica '[IO]' con il proprio nome reale nel verbale Word e nella trascrizione; vuoto = default."
+            ),
+        ),
     )
     glossary: str = field(
         default="",
         metadata=_spec(
             "Glossario (termini separati da virgola o uno per riga)",
-            help_text="Usato come initial prompt di Whisper e nei prompt LLM; vuoto = omesso.",
+            help_text=(
+                "Termini tecnici, acronimi e nomi propri (separati da virgola o a capo). "
+                "Guida Whisper a trascriverli senza errori fonetici e istruisce l'LLM a usarli correttamente."
+            ),
         ),
     )
 
@@ -150,7 +352,10 @@ class ExecutionSettings:
             "Esecuzione Whisper/LLM",
             choices=PARALLEL_POLICY_CHOICES,
             restart=True,
-            help_text="auto = in parallelo solo se il modello LLM risulta caricato su GPU.",
+            help_text=(
+                "Politica di concorrenza Whisper/LLM. "
+                "'auto' esegue in parallelo solo se l'LLM è su GPU; 'sequential' elabora uno alla volta per non saturare la CPU; 'parallel' forza l'elaborazione simultanea."
+            ),
         ),
     )
 

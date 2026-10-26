@@ -1,8 +1,12 @@
-# Verbalia - Teams Meeting Scribe
+<p align="center">
+  <img src="assets/logo.png" alt="Verbalia Logo" width="160" />
+</p>
+
+# Verbalia
 
 ## 1. Titolo e Descrizione
 
-**Teams Meeting Scribe** è un'applicazione desktop Python per **Windows 10/11 (64-bit)** progettata per rilevare call di Microsoft Teams, registrare l'audio in doppia traccia (**microfono locale `[IO]`** + **WASAPI loopback `[ALTRI]`**), trascrivere in modalità *rolling chunk* tramite **faster-whisper**, sintetizzare la conversazione con approccio gerarchico **Map-Reduce** tramite **Ollama** e produrre automaticamente un **documento Microsoft Word (`.docx`)** professionale contenente:
+**Verbalia** è un'applicazione desktop Python per **Windows 10/11 (64-bit)** progettata per rilevare call di Microsoft Teams, registrare l'audio in doppia traccia (**microfono locale `[IO]`** + **WASAPI loopback `[ALTRI]`**), trascrivere in modalità *rolling chunk* tramite **faster-whisper**, sintetizzare la conversazione con approccio gerarchico **Map-Reduce** tramite **Ollama** e produrre automaticamente un **documento Microsoft Word (`.docx`)** professionale contenente:
 
 1. **Bozza Mail di Recap** pronta per l'invio su Outlook (Oggetto, TL;DR, Decisioni, Next Steps);
 2. **Verbale Dettagliato della Riunione** strutturato per argomenti, decisioni confermate, rischi/dipendenze e **tabella Action Items**.
@@ -168,8 +172,8 @@ flowchart TD
 ## 7. Installazione Rapida
 
 ```powershell
-git clone https://github.com/<owner>/teams_meeting_scribe.git
-cd teams_meeting_scribe
+git clone https://github.com/<owner>/Verbalia.git
+cd Verbalia
 python main.py --setup-only
 python main.py
 ```
@@ -207,7 +211,7 @@ Tutte le modalità operative principali sono mutuamente esclusive:
 | `python main.py --diagnostics` | Stampa a schermo un report diagnostico completo dell'ambiente hardware/software (compresa la quota del modello LLM su GPU) senza esporre dati sensibili. |
 | `python main.py --dashboard [--tab cruscotto\|storico\|impostazioni]` | Apre il cruscotto Tkinter in una finestra separata (istanza singola). Lo stesso cruscotto si apre dalla tray con "Apri Cruscotto" e "Impostazioni". |
 
-`--auto` e `--record-now` usano un mutex di sistema (`Local\teams_meeting_scribe`): una seconda istanza registrante viene rifiutata.
+`--auto` e `--record-now` usano un mutex di sistema (`Local\Verbalia`): una seconda istanza registrante viene rifiutata.
 
 ### Codici di Uscita (Exit Codes)
 - `0`: Esecuzione completata con successo.
@@ -375,7 +379,7 @@ In modalità `--auto` non serve intervenire: all'avvio l'applicazione scansiona 
   non è un errore bloccante; l'applicazione utilizzerà automaticamente il titolo `Riunione Teams`. Assicurati che Outlook classico non mostri finestre modali bloccate.
 - **Errore CUDA / librerie `cublas` o `cudnn` mancanti**:
   senza GPU NVIDIA il tentativo CUDA viene saltato; se una GPU è presente ma non inizializzabile si passa alla CPU (`medium`, `int8`) e il tentativo non viene ripetuto fino al riavvio. Per forzare la CPU imposta `WHISPER_DEVICE = "cpu"` in `config.py`.
-- **"Teams Meeting Scribe è già in esecuzione"**:
+- **"Verbalia è già in esecuzione"**:
   esiste già un'istanza registrante: usare il menu della tray o il cruscotto. Se l'icona non è visibile, verificare in Gestione attività i processi `python.exe`.
 - **Elaborazione lenta e "LLM su GPU: 0%"**:
   vedere la sezione "GPU per Ollama"; con la sola CPU ogni blocco MAP richiede alcuni minuti.
@@ -409,4 +413,4 @@ Per rimuovere completamente l'applicazione e tutti i relativi artefatti dalla po
 3. **Rimuovi output, log e file temporanei**: elimina il contenuto delle cartelle `output\`, `logs\` e `temp\` (dopo aver archiviato i verbali `.docx` che desideri conservare).
 4. **Rimuovi i modelli Ollama** (opzionale): esegui `ollama rm llama3.1:8b`.
 5. **Rimuovi la cache dei modelli faster-whisper / HuggingFace** (opzionale): elimina la cartella `%USERPROFILE%\.cache\huggingface\hub\`.
-6. **Rimuovi la directory del progetto**: elimina l'intera cartella `teams_meeting_scribe`.
+6. **Rimuovi la directory del progetto**: elimina l'intera cartella `Verbalia`.

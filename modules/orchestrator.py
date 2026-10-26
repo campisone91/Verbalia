@@ -1309,7 +1309,7 @@ class MeetingScribeApplication:
                 f"## TL;DR\nLa pipeline sintetica ({DRY_RUN_MARKER}) ha completato tutti gli stage previsti.\n\n"
                 "## Decisioni Principali\n- Validazione offline completata con successo.\n\n"
                 "## Next Steps\n- Da assegnare: Controllo del file Word nella cartella output.\n\n"
-                "## Chiusura\nCordiali saluti,\nTeams Meeting Scribe\n"
+                "## Chiusura\nCordiali saluti,\nVerbalia\n"
             )
             atomic_write_text(detailed_minutes_path, synthetic_minutes)
             atomic_write_text(recap_email_path, synthetic_email)

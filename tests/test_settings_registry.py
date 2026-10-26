@@ -85,6 +85,50 @@ def test_corrupted_settings_fall_back_to_defaults(tmp_path: Path) -> None:
     assert load_settings(path).output.user_display_name == "Andrea"
 
 
+def test_all_settings_fields_have_help_text_and_dashboard_renders_them(tmp_path: Path) -> None:
+    from dataclasses import fields
+    from modules.settings import AppSettings
+    from modules.dashboard_ui import DashboardApp
+
+    settings = AppSettings()
+    total_fields = 0
+    for group_field in fields(settings):
+        group = getattr(settings, group_field.name)
+        for item in fields(group):
+            total_fields += 1
+            help_text = dict(item.metadata).get("help", "")
+            assert help_text, f"Campo {group_field.name}.{item.name} privo di help_text"
+            assert len(help_text) >= 20, f"help_text troppo breve per {group_field.name}.{item.name}"
+
+    assert total_fields == 26
+
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+    except Exception:
+        return
+    root.withdraw()
+    try:
+        registry = JobRegistry(tmp_path / "test.db")
+        app = DashboardApp(root, registry, initial_tab="impostazioni")
+        root.update()
+        rendered_help: list[str] = []
+        for child in app.tab_settings.winfo_children():
+            if isinstance(child, tk.Canvas):
+                for f in child.winfo_children():
+                    for box in f.winfo_children():
+                        if isinstance(box, tk.ttk.LabelFrame):
+                            for w in box.winfo_children():
+                                if w.grid_info().get("column") == 2 and isinstance(w, tk.ttk.Label):
+                                    txt = w.cget("text")
+                                    if txt:
+                                        rendered_help.append(txt)
+        assert len(rendered_help) == 26
+        app._setting_vars.clear()
+    finally:
+        root.destroy()
+
+
 # ------------------------------------------------------------ job registry
 def test_job_registry_jobs_events_commands_and_history(tmp_path: Path) -> None:
     registry = JobRegistry(tmp_path / "history.db")

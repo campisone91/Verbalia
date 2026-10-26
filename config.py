@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 
 # 8.1 Metadati
-APP_NAME: str = "teams_meeting_scribe"
+APP_NAME: str = "Verbalia"
 APP_VERSION: str = "0.1.0"
 STATE_SCHEMA_VERSION: int = 1
 MIN_PYTHON_VERSION: tuple[int, int] = (3, 10)
@@ -22,6 +22,9 @@ EXIT_CLEANUP_FAILED: int = 6
 # 8.2 Path
 PROJECT_ROOT: Path = Path(__file__).resolve().parent
 PROMPTS_DIR: Path = PROJECT_ROOT / "prompts"
+ASSETS_DIR: Path = PROJECT_ROOT / "assets"
+APP_ICON_PATH: Path = ASSETS_DIR / "icon.ico"
+APP_LOGO_PATH: Path = ASSETS_DIR / "logo.png"
 BIN_DIR: Path = PROJECT_ROOT / "bin"
 LOG_DIR: Path = PROJECT_ROOT / "logs"
 TEMP_DIR: Path = PROJECT_ROOT / "temp"
@@ -45,6 +48,7 @@ FFMPEG_DOWNLOAD_TIMEOUT_SEC: int = 120
 def ensure_runtime_directories() -> None:
     """Crea le directory runtime necessarie se non esistono."""
     for directory in (
+        ASSETS_DIR,
         BIN_DIR,
         LOG_DIR,
         TEMP_DIR,

@@ -1,1 +1,1 @@
-"""Suite di test automatici offline per Teams Meeting Scribe."""
+"""Suite di test automatici offline per Verbalia."""

@@ -2,7 +2,7 @@
 
 ## Segnalazione Responsabile di Vulnerabilità
 
-La sicurezza e la riservatezza dei dati trattati localmente sono prioritarie per `teams_meeting_scribe`.
+La sicurezza e la riservatezza dei dati trattati localmente sono prioritarie per `Verbalia`.
 
 Se individui una vulnerabilità di sicurezza (ad esempio path traversal, esecuzione arbitraria di comandi, esposizione involontaria di dati nei log, problemi nel bootstrap o nella gestione dei file temporanei):
 

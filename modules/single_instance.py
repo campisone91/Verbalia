@@ -8,8 +8,8 @@ from modules.logging_setup import get_logger
 
 logger = get_logger("single_instance")
 
-APP_MUTEX_NAME: str = "Local\\teams_meeting_scribe"
-DASHBOARD_MUTEX_NAME: str = "Local\\teams_meeting_scribe_dashboard"
+APP_MUTEX_NAME: str = "Local\\Verbalia"
+DASHBOARD_MUTEX_NAME: str = "Local\\Verbalia_dashboard"
 _ERROR_ALREADY_EXISTS: int = 183
 
 

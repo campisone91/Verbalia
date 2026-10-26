@@ -9,7 +9,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
-from config import APP_NAME, APP_VERSION, EXIT_MISSING_DEPENDENCY, EXIT_SUCCESS
+from config import APP_ICON_PATH, APP_NAME, APP_VERSION, EXIT_MISSING_DEPENDENCY, EXIT_SUCCESS
 from modules.contracts import Stage, UiCommandType, now_tz
 from modules.job_registry import JOB_STATUS_LABELS_IT, JobRegistry, parse_iso
 from modules.logging_setup import get_logger
@@ -621,8 +621,9 @@ class DashboardApp:
         canvas = tk.Canvas(outer, highlightthickness=0)
         scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
         content = ttk.Frame(canvas)
+        content_id = canvas.create_window((0, 0), window=content, anchor="nw")
         content.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.create_window((0, 0), window=content, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(content_id, width=e.width))
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
@@ -641,6 +642,7 @@ class DashboardApp:
             group = getattr(settings, group_name)
             box = ttk.LabelFrame(content, text=SETTINGS_GROUP_LABELS.get(group_name, group_name), padding=8)
             box.pack(fill="x", padx=4, pady=4)
+            box.columnconfigure(2, weight=1)
             for row_index, item in enumerate(fields(group)):
                 spec = dict(item.metadata)
                 label = str(spec.get("label", item.name))
@@ -651,21 +653,32 @@ class DashboardApp:
                 value = getattr(group, item.name)
                 key = (group_name, item.name)
                 if group_name == "output" and item.name == "glossary":
-                    text = tk.Text(box, width=70, height=4, font=("Segoe UI", 9))
+                    text = tk.Text(box, width=44, height=3, font=("Segoe UI", 9))
                     text.insert("1.0", str(value))
-                    text.grid(row=row_index, column=1, sticky="we", pady=2)
+                    text.grid(row=row_index, column=1, sticky="w", pady=2)
                     self._glossary_text = text
+                    help_text = spec.get("help")
+                    if help_text:
+                        ttk.Label(
+                            box,
+                            text=str(help_text),
+                            foreground="#555555",
+                            wraplength=480,
+                            justify="left",
+                        ).grid(row=row_index, column=2, sticky="w", padx=(12, 4), pady=2)
                     continue
                 if isinstance(value, bool):
                     var: Any = tk.BooleanVar(value=value)
                     ttk.Checkbutton(box, variable=var).grid(row=row_index, column=1, sticky="w")
                 elif group_name == "ollama" and item.name == "model":
                     var = tk.StringVar(value=str(value))
-                    combo = ttk.Combobox(box, textvariable=var, width=40)
-                    combo.grid(row=row_index, column=1, sticky="w")
+                    frame_model = ttk.Frame(box)
+                    frame_model.grid(row=row_index, column=1, sticky="w", pady=2)
+                    combo = ttk.Combobox(frame_model, textvariable=var, width=28)
+                    combo.pack(side="left")
                     self._model_combo = combo
-                    ttk.Button(box, text="Aggiorna elenco", command=self._refresh_models).grid(
-                        row=row_index, column=2, padx=6
+                    ttk.Button(frame_model, text="Aggiorna elenco", command=self._refresh_models).pack(
+                        side="left", padx=(6, 0)
                     )
                 elif spec.get("choices"):
                     var = tk.StringVar(value=str(value))
@@ -679,9 +692,13 @@ class DashboardApp:
                     )
                 help_text = spec.get("help")
                 if help_text:
-                    ttk.Label(box, text=str(help_text), foreground="#666666").grid(
-                        row=row_index, column=3, sticky="w", padx=6
-                    )
+                    ttk.Label(
+                        box,
+                        text=str(help_text),
+                        foreground="#555555",
+                        wraplength=480,
+                        justify="left",
+                    ).grid(row=row_index, column=2, sticky="w", padx=(12, 4), pady=2)
                 self._setting_vars[key] = var
 
         bar = ttk.Frame(content)
@@ -839,6 +856,11 @@ def run_dashboard(initial_tab: str | None = None) -> int:
     try:
         registry = JobRegistry()
         root = tk.Tk()
+        if APP_ICON_PATH.exists():
+            try:
+                root.iconbitmap(default=str(APP_ICON_PATH))
+            except Exception:
+                pass
         try:
             root.iconname(APP_NAME)
         except tk.TclError:

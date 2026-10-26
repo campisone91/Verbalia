@@ -17,7 +17,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
-APP_NAME: str = "teams_meeting_scribe"
+APP_NAME: str = "Verbalia"
 APP_VERSION: str = "0.1.0"
 STATE_SCHEMA_VERSION: int = 1
 MIN_PYTHON_VERSION: tuple[int, int] = (3, 10)
@@ -657,7 +657,7 @@ def ensure_ollama_ready(base_url: str, model_name: str) -> None:
         if not ollama_exe:
             sys.stderr.write(
                 f"\n[ERRORE DIPENDENZA] Ollama non è raggiungibile su {base_url} e 'ollama.exe' non è stato trovato nel sistema.\n"
-                "teams_meeting_scribe opera al 100% in locale e necessita di Ollama per la sintesi dei verbali.\n\n"
+                "Verbalia opera al 100% in locale e necessita di Ollama per la sintesi dei verbali.\n\n"
                 "Istruzioni di installazione e avvio:\n"
                 "  1. Scarica e installa Ollama da: https://ollama.com/download\n"
                 "     (oppure da PowerShell: winget install Ollama.Ollama)\n"

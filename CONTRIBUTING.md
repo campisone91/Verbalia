@@ -1,6 +1,6 @@
 # Guida alla Contribuzione (`CONTRIBUTING.md`)
 
-Grazie per l'interesse nel contribuire a **Teams Meeting Scribe**! Questo documento definisce le regole tecniche, lo stile del codice e le norme di sicurezza/privacy obbligatorie per ogni contributo.
+Grazie per l'interesse nel contribuire a **Verbalia**! Questo documento definisce le regole tecniche, lo stile del codice e le norme di sicurezza/privacy obbligatorie per ogni contributo.
 
 ---
 
@@ -10,8 +10,8 @@ Il progetto richiede **Windows 10/11 (64-bit)** e **Python 3.10+**. Per lo svilu
 
 ```powershell
 # 1. Clona il repository
-git clone https://github.com/<owner>/teams_meeting_scribe.git
-cd teams_meeting_scribe
+git clone https://github.com/<owner>/Verbalia.git
+cd Verbalia
 
 # 2. Crea e attiva un virtual environment dedicato
 python -m venv .venv
