@@ -34,6 +34,14 @@ from modules.single_instance import (  # noqa: E402
     show_message_box,
 )
 
+if sys.platform == "win32":
+    try:
+        import ctypes
+
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"{APP_NAME}.MeetingScribe.{APP_VERSION}")
+    except Exception:
+        pass
+
 
 class _ScribeArgumentParser(argparse.ArgumentParser):
     """ArgumentParser che converte gli errori di sintassi CLI in exit code 2 deterministico."""

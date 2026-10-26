@@ -41,6 +41,7 @@ from config import (
     PROMPTS_DIR,
     REQUIRE_MANUAL_CONFIRMATION_FOR_FIRST_RECORDING,
     SHOW_RECORDING_NOTIFICATION,
+    SHOW_STARTUP_NOTIFICATION,
     STATE_SCHEMA_VERSION,
     TEMP_DIR,
     UI_COMMAND_POLL_INTERVAL_SEC,
@@ -795,6 +796,41 @@ class MeetingScribeApplication:
         self.processing_queue.put(ProcessingJob(session_id=session_id, session_dir=session_dir))
         return True
 
+    def cancel_job(self, session_id: str) -> bool:
+        """Arresta un'elaborazione in corso o la rimuove dalla coda (comando dal cruscotto)."""
+        if self.worker is not None and self.worker.cancel_session(session_id):
+            self.logger.info("Elaborazione della sessione %s arrestata.", session_id)
+            self._notify("Elaborazione Arrestata", f"Sessione {session_id} interrotta su richiesta.")
+            return True
+
+        if self.processing_queue.remove(session_id):
+            self._publish_job(
+                session_id,
+                status="interrupted",
+                detail="Elaborazione rimossa dalla coda dal cruscotto",
+            )
+            self._notify("Elaborazione Rimossa", f"Sessione {session_id} rimossa dalla coda.")
+            return True
+
+        live = self.live
+        if live is not None and live.session_id == session_id:
+            self.logger.info("Registrazione live della sessione %s arrestata dall'utente.", session_id)
+            if self.watcher is not None:
+                self.watcher.request_finalize()
+            if live.recorder is not None:
+                live.recorder.stop_capture()
+            self._publish_job(
+                session_id,
+                status="interrupted",
+                detail="Registrazione interrotta dall'utente",
+            )
+            self.live = None
+            self.tray.set_recording_status(Stage.IDLE, "Registrazione annullata dall'utente")
+            self._notify("Registrazione Annullata", "La registrazione in corso è stata interrotta.")
+            return True
+
+        return False
+
     def _recover_pending_sessions(self) -> int:
         """Accoda in ordine cronologico le sessioni rimaste su disco e non in uso da altri."""
         recovered = 0
@@ -874,6 +910,10 @@ class MeetingScribeApplication:
             session_id = payload.get("session_id")
             if isinstance(session_id, str) and session_id:
                 self.retry_job(session_id)
+        elif command == UiCommandType.CANCEL_JOB.value:
+            session_id = payload.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                self.cancel_job(session_id)
         elif command == "reload_settings":
             self.reload_settings()
             if self.live is None:
@@ -908,6 +948,11 @@ class MeetingScribeApplication:
         """Modalità automatica: tray, watcher e registrazione concorrente all'elaborazione (Sezione 28.1)."""
         self._start_services()
         self.tray.set_recording_status(Stage.IDLE, "In attesa di call Microsoft Teams")
+        if SHOW_STARTUP_NOTIFICATION:
+            self._notify(
+                "Verbalia Attivo",
+                "L'applicazione è in esecuzione in background e pronta a registrare le call di Microsoft Teams.",
+            )
         if self.registry is not None:
             try:
                 self.registry.purge_older_than(HISTORY_RETENTION_DAYS)

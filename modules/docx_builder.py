@@ -207,6 +207,8 @@ def _contains_raw_markdown(text: str) -> bool:
 def validate_docx_file(
     docx_path: Path,
     min_size_bytes: int = DOCX_MIN_SIZE_BYTES,
+    *,
+    require_recap_email: bool = True,
 ) -> None:
     """Valida l'integrità strutturale e di contenuto del file DOCX generato."""
     if not docx_path.exists() or not docx_path.is_file():
@@ -244,17 +246,20 @@ def validate_docx_file(
         if PART2_HEADING in text and part2_idx is None:
             part2_idx = idx
 
-    if part1_idx is None:
-        raise DocumentValidationError(f"Sezione obbligatoria mancante: '{PART1_HEADING}'.")
-    if part2_idx is None:
-        raise DocumentValidationError(f"Sezione obbligatoria mancante: '{PART2_HEADING}'.")
-    if part1_idx >= part2_idx:
-        raise DocumentValidationError(
-            f"Ordine delle sezioni non valido: '{PART1_HEADING}' deve precedere '{PART2_HEADING}'."
-        )
-
-    if not _has_page_break(doc):
-        raise DocumentValidationError("Page break obbligatorio mancante tra le sezioni.")
+    if require_recap_email:
+        if part1_idx is None:
+            raise DocumentValidationError(f"Sezione obbligatoria mancante: '{PART1_HEADING}'.")
+        if part2_idx is None:
+            raise DocumentValidationError(f"Sezione obbligatoria mancante: '{PART2_HEADING}'.")
+        if part1_idx >= part2_idx:
+            raise DocumentValidationError(
+                f"Ordine delle sezioni non valido: '{PART1_HEADING}' deve precedere '{PART2_HEADING}'."
+            )
+        if not _has_page_break(doc):
+            raise DocumentValidationError("Page break obbligatorio mancante tra le sezioni.")
+    else:
+        if part2_idx is None:
+            raise DocumentValidationError(f"Sezione obbligatoria mancante: '{PART2_HEADING}'.")
 
     for p_text in paragraphs:
         if _contains_raw_markdown(p_text):
@@ -390,7 +395,7 @@ class MeetingDocxBuilder:
         metadata: MeetingMetadata,
         started_at: datetime,
         ended_at: datetime,
-        recap_email_path: Path,
+        recap_email_path: Path | None,
         detailed_minutes_path: Path,
         output_dir: Path,
         *,
@@ -401,21 +406,28 @@ class MeetingDocxBuilder:
         """Costruisce, valida e promuove atomicamente il file DOCX finale.
 
         Se transcript_path è indicato e il file esiste, il documento include in coda la
-        parte 3 con la trascrizione integrale.
+        parte 3 con la trascrizione integrale. Se recap_email_path è None, omette la Parte 1.
         """
-        if not recap_email_path.exists():
-            raise DocumentBuildError(f"File recap email mancante: {recap_email_path}")
+        has_recap = recap_email_path is not None and recap_email_path.exists()
+        recap_text = ""
+        if recap_email_path is not None:
+            if not recap_email_path.exists():
+                raise DocumentBuildError(f"File recap email mancante: {recap_email_path}")
+            try:
+                recap_text = recap_email_path.read_text(encoding="utf-8").strip()
+            except OSError as exc:
+                raise DocumentBuildError(f"Errore lettura file REDUCE: {exc}") from exc
+            if not recap_text:
+                raise DocumentBuildError("Il contenuto della bozza mail di recap è vuoto.")
+
         if not detailed_minutes_path.exists():
             raise DocumentBuildError(f"File verbale dettagliato mancante: {detailed_minutes_path}")
 
         try:
-            recap_text = recap_email_path.read_text(encoding="utf-8").strip()
             minutes_text = detailed_minutes_path.read_text(encoding="utf-8").strip()
         except OSError as exc:
             raise DocumentBuildError(f"Errore lettura file REDUCE: {exc}") from exc
 
-        if not recap_text:
-            raise DocumentBuildError("Il contenuto della bozza mail di recap è vuoto.")
         if not minutes_text:
             raise DocumentBuildError("Il contenuto del verbale dettagliato è vuoto.")
 
@@ -440,12 +452,12 @@ class MeetingDocxBuilder:
             self._configure_styles_and_layout(doc, metadata)
             self._build_header_and_metadata_box(doc, metadata, started_at, ended_at)
 
-            part1_h1 = doc.add_heading(PART1_HEADING, level=1)
-            part1_h1.paragraph_format.space_before = Pt(14)
-            part1_h1.paragraph_format.space_after = Pt(6)
-            self._render_markdown_block(doc, recap_text, is_detailed_minutes=False)
-
-            doc.add_page_break()
+            if has_recap:
+                part1_h1 = doc.add_heading(PART1_HEADING, level=1)
+                part1_h1.paragraph_format.space_before = Pt(14)
+                part1_h1.paragraph_format.space_after = Pt(6)
+                self._render_markdown_block(doc, recap_text, is_detailed_minutes=False)
+                doc.add_page_break()
 
             part2_h1 = doc.add_heading(PART2_HEADING, level=1)
             part2_h1.paragraph_format.space_before = Pt(10)
@@ -475,7 +487,7 @@ class MeetingDocxBuilder:
             raise DocumentBuildError(f"Errore durante la generazione del DOCX: {exc}") from exc
 
         try:
-            validate_docx_file(temp_path)
+            validate_docx_file(temp_path, require_recap_email=has_recap)
             replace_with_retry(temp_path, final_path)
         except DocumentValidationError:
             raise

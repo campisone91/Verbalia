@@ -322,6 +322,16 @@ class OutputSettings:
             ),
         ),
     )
+    generate_recap_email: bool = field(
+        default=True,
+        metadata=_spec(
+            "Genera bozza email di recap",
+            help_text=(
+                "Genera la bozza email di recap pronta per Outlook. "
+                "Disattivare se si desidera solo il verbale dettagliato, velocizzando l'elaborazione LLM e risparmiando token."
+            ),
+        ),
+    )
     user_display_name: str = field(
         default="",
         metadata=_spec(
@@ -425,6 +435,7 @@ def default_settings() -> AppSettings:
             output_dir="",
             organize_by_day=bool(_config.OUTPUT_ORGANIZE_BY_DAY),
             include_transcript=bool(_config.DOCX_INCLUDE_TRANSCRIPT),
+            generate_recap_email=True,
             user_display_name=str(_config.USER_DISPLAY_NAME),
             glossary=str(_config.CUSTOM_GLOSSARY),
         ),

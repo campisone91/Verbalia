@@ -24,6 +24,7 @@ from modules.audio_utils import get_wav_duration_sec, normalize_wav_with_ffmpeg
 from modules.contracts import (
     AudioChunk,
     ChunkStatus,
+    JobCancelledError,
     ResumeError,
     SessionContext,
     SessionLockedError,
@@ -262,9 +263,28 @@ class SessionProcessor:
         self._more_jobs_pending = more_jobs_pending
         self._current_summarizer: SummarizerLike | None = None
         self._gpu_hint_notified = False
+        self._cancel_event = threading.Event()
+        self._current_runtime: SessionRuntime | None = None
+        self._cancelled_session_ids: set[str] = set()
+
+    def was_cancelled(self, session_id: str) -> bool:
+        return session_id in self._cancelled_session_ids
+
+    def cancel_active_job(self) -> None:
+        """Annulla cooperativamente il job attualmente in esecuzione su richiesta dell'utente."""
+        self._cancel_event.set()
+        runtime = self._current_runtime
+        if runtime is not None:
+            self._cancelled_session_ids.add(runtime.session_id)
+            if runtime.transcriber is not None:
+                try:
+                    runtime.transcriber.cancel()
+                except Exception as exc:
+                    logger.debug("Cancellazione transcriber non riuscita: %s", exc)
+        self.cancel_current()
 
     def cancel_current(self) -> None:
-        """Annulla la chiamata Ollama in streaming del job in corso (shutdown)."""
+        """Annulla la chiamata Ollama in streaming del job in corso (shutdown o cancellazione)."""
         summarizer = self._current_summarizer
         cancel = getattr(summarizer, "cancel_active_request", None)
         if callable(cancel):
@@ -380,12 +400,26 @@ class SessionProcessor:
     def process(self, runtime: SessionRuntime) -> int:
         """Esegue l'intero job della sessione; solleva ShutdownRequested se interrotto dall'arresto."""
         with bind_log_session(runtime.session_id):
+            self._cancel_event.clear()
+            self._current_runtime = runtime
             try:
                 return self._process(runtime)
             except ShutdownRequested:
                 logger.info("Elaborazione della sessione interrotta dall'arresto: verrà ripresa.")
                 self._publish_job(runtime, status="interrupted", detail="Interrotta allo spegnimento")
                 raise
+            except JobCancelledError:
+                logger.info(
+                    "Elaborazione della sessione %s arrestata su richiesta dell'utente.",
+                    runtime.session_id,
+                )
+                self._publish_job(
+                    runtime,
+                    status="interrupted",
+                    detail="Arrestato dall'utente dal cruscotto",
+                )
+                runtime.reporter.rebase(Stage.IDLE, "Elaborazione arrestata dall'utente")
+                return EXIT_APP_ERROR
             except Exception as exc:
                 exit_code = int(getattr(exc, "exit_code", EXIT_APP_ERROR))
                 if exit_code == EXIT_CLEANUP_FAILED:
@@ -399,6 +433,7 @@ class SessionProcessor:
                 return exit_code
             finally:
                 self._current_summarizer = None
+                self._current_runtime = None
 
     def _process(self, runtime: SessionRuntime) -> int:
         sm = runtime.state_manager
@@ -420,6 +455,7 @@ class SessionProcessor:
             reporter.set_stage(Stage.TRANSCRIBING_FINAL, "Completamento trascrizione ultimi chunk")
             transcriber.drain(self._shutdown_event)
         runtime.recorder = None
+        self._check_shutdown()
 
         transcripts_dir = session_dir / "transcripts"
         transcripts_dir.mkdir(parents=True, exist_ok=True)
@@ -455,6 +491,7 @@ class SessionProcessor:
         )
         self._after_first_inference(runtime)
 
+        self._check_shutdown()
         reporter.set_stage(Stage.SUMMARIZING_REDUCE, "Generazione verbale dettagliato e bozza mail")
         context = sm.load()
         detailed_minutes_path = session_dir / "reduce" / "detailed_minutes.md"
@@ -468,22 +505,26 @@ class SessionProcessor:
                 ended_at=context.ended_at,
             )
 
-        recap_email_path = session_dir / "reduce" / "recap_email.md"
-        if not (context.email_reduce_completed and recap_email_path.is_file()):
-            recap_email_path = summarizer.run_reduce_email(
-                detailed_minutes_path=detailed_minutes_path,
-                metadata=context.metadata,
-                session_dir=session_dir,
-            )
+        output_settings = runtime.settings.output
+        recap_email_path: Path | None = None
+        if getattr(output_settings, "generate_recap_email", True):
+            self._check_shutdown()
+            recap_email_path = session_dir / "reduce" / "recap_email.md"
+            if not (context.email_reduce_completed and recap_email_path.is_file()):
+                recap_email_path = summarizer.run_reduce_email(
+                    detailed_minutes_path=detailed_minutes_path,
+                    metadata=context.metadata,
+                    session_dir=session_dir,
+                )
 
         more_pending = self._more_jobs_pending() if self._more_jobs_pending is not None else False
         if OLLAMA_UNLOAD_AFTER_PIPELINE and not more_pending:
             summarizer.unload_model()
 
+        self._check_shutdown()
         reporter.set_stage(Stage.BUILDING_DOCX, "Costruzione documento Word")
         context = sm.load()
         ended_at = context.ended_at or now_tz()
-        output_settings = runtime.settings.output
         final_docx_path = context.final_docx_path
         if final_docx_path is None or not final_docx_path.is_file():
             final_docx_path = _call_with_supported_kwargs(
@@ -500,7 +541,10 @@ class SessionProcessor:
             )
 
         reporter.set_stage(Stage.VERIFYING_DOCX, f"Verifica integrità {final_docx_path.name}")
-        validate_docx_file(final_docx_path)
+        validate_docx_file(
+            final_docx_path,
+            require_recap_email=(recap_email_path is not None and recap_email_path.is_file()),
+        )
 
         def _mark_verified(c: SessionContext) -> None:
             c.final_docx_path = final_docx_path.resolve()
@@ -527,6 +571,8 @@ class SessionProcessor:
     def _check_shutdown(self) -> None:
         if self._shutdown_event.is_set():
             raise ShutdownRequested("Elaborazione interrotta: arresto richiesto.")
+        if self._cancel_event.is_set():
+            raise JobCancelledError("Elaborazione interrotta su richiesta dell'utente.")
 
     def _after_first_inference(self, runtime: SessionRuntime) -> None:
         """Dopo il MAP il modello è in memoria: si misura la quota su GPU e si aggiorna la policy."""
@@ -669,6 +715,23 @@ class ProcessingWorker(threading.Thread):
         with self._lock:
             return self._current.session_id if self._current is not None else None
 
+    def cancel_session(self, session_id: str) -> bool:
+        """Interrompe il job attivo se corrisponde a session_id, o lo rimuove dalla coda."""
+        with self._lock:
+            current_id = self._current.session_id if self._current is not None else None
+            if current_id == session_id:
+                self._processor.cancel_active_job()
+                return True
+        removed = self._queue.remove(session_id)
+        if removed:
+            self._publish(
+                session_id,
+                status="interrupted",
+                detail="Elaborazione rimossa dalla coda dal cruscotto",
+            )
+            return True
+        return False
+
     def run(self) -> None:
         try:
             while not self._shutdown_event.is_set():
@@ -748,6 +811,17 @@ class ProcessingWorker(threading.Thread):
 
         if rc in (EXIT_SUCCESS, EXIT_CLEANUP_FAILED):
             runtime.state_manager.release_owner_lock()
+            return rc
+
+        if self._processor.was_cancelled(runtime.session_id):
+            if runtime.transcriber is not None:
+                runtime.transcriber.cancel()
+            runtime.state_manager.release_owner_lock()
+            job.runtime = None
+            logger.info(
+                "Job %s interrotto dall'utente: non verrà riaccodato automaticamente.",
+                job.session_id,
+            )
             return rc
 
         # Errore: i chunk ancora in coda nel motore condiviso appartengono a un client ormai inutile

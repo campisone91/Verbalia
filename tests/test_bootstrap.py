@@ -143,3 +143,28 @@ def test_bootstrap_checks_and_utilities(tmp_path: Path, monkeypatch: pytest.Monk
     assert "modulo_inventato_xyz" in missing
     assert "os" not in missing
 
+
+def test_headless_stream_safety() -> None:
+    """Verifica che bootstrap funzioni in sicurezza anche quando sys.stdout e sys.stderr sono None (pythonw)."""
+    import subprocess
+    import sys
+    from config import PROJECT_ROOT
+
+    cmd = [
+        sys.executable,
+        "-c",
+        (
+            "import sys; "
+            "sys.stdout = None; "
+            "sys.stderr = None; "
+            "import bootstrap; "
+            "assert sys.stdout is not None; "
+            "assert sys.stderr is not None; "
+            "sys.stdout.write('test'); "
+            "sys.stderr.write('test');"
+        ),
+    ]
+    res = subprocess.run(cmd, cwd=str(PROJECT_ROOT), capture_output=True, timeout=10)
+    assert res.returncode == 0
+
+

@@ -209,6 +209,7 @@ LOG_TRANSCRIPT_CONTENT: bool = False
 # 8.11 Privacy
 REQUIRE_MANUAL_CONFIRMATION_FOR_FIRST_RECORDING: bool = True
 SHOW_RECORDING_NOTIFICATION: bool = True
+SHOW_STARTUP_NOTIFICATION: bool = True
 PRIVACY_NOTICE_TEXT: str = (
     "Questa applicazione registra e trascrive audio locale.\n"
     "Verificare di disporre delle autorizzazioni necessarie\n"

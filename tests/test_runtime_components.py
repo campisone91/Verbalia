@@ -233,17 +233,23 @@ except tk.TclError:
     sys.exit(0)
 root.withdraw()
 app = DashboardApp(root, registry, initial_tab="impostazioni")
+app._info = lambda *args, **kwargs: None
+app._confirm = lambda *args, **kwargs: True
 root.update()
 result = {"active": list(app.active_tree.get_children())}
 app._selected_active = "S1"
 app._refresh_detail()
 result["step_map"] = app.step_vars[3].get()
+app._confirm = lambda *args, **kwargs: True
+app._cmd_stop_selected()
+result["commands_after_stop"] = registry.fetch_pending_commands()
 app._cmd_start_manual()
 result["commands"] = registry.fetch_pending_commands()
 app.var_all_days.set(True)
 app._load_history()
 result["history"] = sorted(app._history_rows)
 result["has_detail_level"] = ("ollama", "detail_level") in app._setting_vars
+result["has_recap_email_setting"] = ("output", "generate_recap_email") in app._setting_vars
 result["map_block"] = str(app._collect_settings_payload()["ollama"]["map_block_duration_sec"])
 for _ in range(10):
     root.update()
@@ -275,7 +281,62 @@ def test_dashboard_window_builds_and_sends_commands(tmp_path: Path) -> None:
         pytest.skip("Display Tk non disponibile")
     assert result["active"] == ["S1"]
     assert result["step_map"].startswith("●")
+    assert result["commands_after_stop"] == [["cancel_job", {"session_id": "S1"}]]
     assert result["commands"] == [["start_manual", {}]]
     assert result["history"] == ["S1", "S2"]
     assert result["has_detail_level"] is True
+    assert result["has_recap_email_setting"] is True
     assert result["map_block"] == "600"
+
+
+def test_worker_and_processor_cancellation(tmp_path: Path) -> None:
+    """Verifica la cancellazione del job in coda e l'interruzione del processore."""
+    from modules.contracts import JobCancelledError
+    from modules.processing import ProcessingJob, ProcessingQueue, ProcessingWorker, SessionProcessor
+
+    queue = ProcessingQueue()
+    job = ProcessingJob(session_id="S_TEST_CANCEL", session_dir=tmp_path / "s_test")
+    queue.put(job)
+    assert len(queue) == 1
+
+    bus = EventBus()
+    shutdown = threading.Event()
+
+    class _FakeEngine:
+        pass
+
+    class _FakeArbiter:
+        parallel = False
+
+    class _FakeDocx:
+        pass
+
+    processor = SessionProcessor(
+        engine=_FakeEngine(),  # type: ignore[arg-type]
+        arbiter=_FakeArbiter(),  # type: ignore[arg-type]
+        bus=bus,
+        shutdown_event=shutdown,
+        docx_builder=_FakeDocx(),  # type: ignore[arg-type]
+        summarizer_provider=lambda _r: None,  # type: ignore[return-value]
+        output_dir_provider=lambda _r: tmp_path,
+        ffmpeg_provider=lambda: tmp_path,
+    )
+
+    worker = ProcessingWorker(
+        queue=queue,
+        processor=processor,
+        bus=bus,
+        shutdown_event=shutdown,
+        runtime_factory=lambda _p: None,  # type: ignore[return-value]
+    )
+
+    # 1. Cancellazione di un job in coda
+    cancelled = worker.cancel_session("S_TEST_CANCEL")
+    assert cancelled is True
+    assert len(queue) == 0
+
+    # 2. Cancellazione del job attivo sul processore
+    processor.cancel_active_job()
+    with pytest.raises(JobCancelledError):
+        processor._check_shutdown()
+

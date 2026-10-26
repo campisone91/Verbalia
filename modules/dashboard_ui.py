@@ -238,7 +238,11 @@ class DashboardApp:
         buttons.pack(fill="x", pady=(8, 4))
         ttk.Button(buttons, text="Avvia registrazione manuale", command=self._cmd_start_manual).pack(side="left")
         ttk.Button(buttons, text="Termina call ora", command=self._cmd_finalize).pack(side="left", padx=4)
+        self.btn_stop = ttk.Button(buttons, text="Arresta elaborazione", command=self._cmd_stop_selected)
+        self.btn_stop.pack(side="left", padx=4)
+        self.btn_stop.state(["disabled"])
         ttk.Button(buttons, text="Riprova", command=self._cmd_retry_selected).pack(side="left", padx=4)
+        ttk.Button(buttons, text="Copia bozza mail", command=self._cmd_copy_email).pack(side="left", padx=4)
         ttk.Button(buttons, text="Apri DOCX", command=self._open_selected_docx).pack(side="left", padx=4)
         ttk.Button(buttons, text="Apri cartella", command=self._open_selected_folder).pack(side="left", padx=4)
 
@@ -283,6 +287,74 @@ class DashboardApp:
     def _cmd_finalize(self) -> None:
         self._send(UiCommandType.FINALIZE_NOW.value)
 
+    def _cmd_stop_selected(self) -> None:
+        session_id = self._selected_active
+        if not session_id:
+            self._info("Arresta", "Selezionare prima una sessione attiva nella tabella.")
+            return
+        job = self._active_jobs.get(session_id)
+        title = str(job.get("title") or session_id) if job else session_id
+        if not self._confirm(
+            "Arresta elaborazione",
+            f"Sei sicuro di voler arrestare l'elaborazione per '{title}'?\n\n"
+            "Tutti i dati e i file audio finora prodotti saranno preservati.\n"
+            "Potrai riprendere l'elaborazione in qualsiasi momento cliccando 'Riprova'.",
+        ):
+            return
+        self._send(UiCommandType.CANCEL_JOB.value, {"session_id": session_id})
+        self._info("Arresta elaborazione", "Richiesta inviata: l'elaborazione verrà arrestata.")
+
+    def _cmd_copy_email(self) -> None:
+        job = self._job_for_action()
+        if not job:
+            self._info("Copia bozza mail", "Selezionare prima una sessione.")
+            return
+
+        text = ""
+        session_dir_str = job.get("session_dir")
+        if isinstance(session_dir_str, str):
+            candidate = Path(session_dir_str) / "reduce" / "recap_email.md"
+            if candidate.is_file():
+                try:
+                    text = candidate.read_text(encoding="utf-8").strip()
+                except Exception as exc:
+                    logger.debug("Lettura recap_email.md fallita: %s", exc)
+
+        if not text:
+            docx_str = job.get("docx_path")
+            if isinstance(docx_str, str) and Path(docx_str).is_file():
+                try:
+                    import docx
+
+                    d = docx.Document(docx_str)
+                    extracted: list[str] = []
+                    capturing = False
+                    for p in d.paragraphs:
+                        p_text = p.text.strip()
+                        if "Parte 1 - Bozza Email di Recap" in p_text:
+                            capturing = True
+                            continue
+                        elif "Parte 2 - Verbale Dettagliato" in p_text:
+                            break
+                        if capturing and p_text:
+                            extracted.append(p_text)
+                    if extracted:
+                        text = "\n\n".join(extracted)
+                except Exception as exc:
+                    logger.debug("Estrazione mail da docx non riuscita: %s", exc)
+
+        if not text:
+            self._info(
+                "Copia bozza mail",
+                "Bozza email non disponibile per questa sessione "
+                "(potrebbe essere stata disattivata nelle impostazioni o la sessione non è ancora completata).",
+            )
+            return
+
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self._info("Copia bozza mail", "Bozza email copiata negli appunti con successo!")
+
     def _cmd_retry_selected(self) -> None:
         session_id = self._selected_active or self._selected_history_id()
         if session_id is None:
@@ -317,6 +389,13 @@ class DashboardApp:
     def _on_active_select(self) -> None:
         selection = self.active_tree.selection()
         self._selected_active = selection[0] if selection else None
+        job = self._active_jobs.get(self._selected_active or "")
+        status = str(job.get("status") or "") if job else ""
+        if hasattr(self, "btn_stop"):
+            if status in ("processing", "queued", "recording"):
+                self.btn_stop.state(["!disabled"])
+            else:
+                self.btn_stop.state(["disabled"])
         self._refresh_detail()
 
     def _refresh(self) -> None:
@@ -388,6 +467,15 @@ class DashboardApp:
             tree.delete(stale)
         if self._selected_active not in self._active_jobs:
             self._selected_active = None
+            if hasattr(self, "btn_stop"):
+                self.btn_stop.state(["disabled"])
+        elif hasattr(self, "btn_stop"):
+            curr_job = self._active_jobs.get(self._selected_active)
+            status = str(curr_job.get("status") or "") if curr_job else ""
+            if status in ("processing", "queued", "recording"):
+                self.btn_stop.state(["!disabled"])
+            else:
+                self.btn_stop.state(["disabled"])
 
     def _refresh_detail(self) -> None:
         job = self._active_jobs.get(self._selected_active or "")
@@ -474,6 +562,7 @@ class DashboardApp:
         actions = ttk.Frame(frame)
         actions.pack(fill="x")
         ttk.Button(actions, text="Apri DOCX", command=self._open_selected_docx).pack(side="left")
+        ttk.Button(actions, text="Copia bozza mail", command=self._cmd_copy_email).pack(side="left", padx=4)
         ttk.Button(actions, text="Apri cartella del giorno", command=self._open_selected_folder).pack(
             side="left", padx=4
         )
@@ -707,6 +796,7 @@ class DashboardApp:
         ttk.Button(bar, text="Ripristina default", command=self._restore_defaults).pack(side="left", padx=4)
         ttk.Button(bar, text="Test Ollama", command=self._test_ollama).pack(side="left", padx=(20, 4))
         ttk.Button(bar, text="Verifica GPU", command=self._check_gpu).pack(side="left", padx=4)
+        ttk.Button(bar, text="Crea icona sul Desktop", command=self._cmd_create_desktop_shortcut).pack(side="left", padx=4)
         ttk.Label(bar, text="I campi marcati (riavvio) hanno effetto al prossimo avvio dell'applicazione.").pack(
             side="left", padx=12
         )
@@ -827,6 +917,20 @@ class DashboardApp:
         _run_in_background(self.root, lambda: probe_ollama_gpu(url, model), _done)
 
     # ================================================================ utility
+    def _confirm(self, title: str, message: str) -> bool:
+        from tkinter import messagebox
+
+        return bool(messagebox.askyesno(title, message, parent=self.root))
+
+    def _cmd_create_desktop_shortcut(self) -> None:
+        try:
+            from tools.create_shortcut import create_desktop_shortcut
+
+            shortcut = create_desktop_shortcut()
+            self._info("Collegamento Desktop", f"Icona creata con successo sul Desktop:\n{shortcut.name}")
+        except Exception as exc:
+            self._error("Collegamento Desktop", f"Impossibile creare il collegamento sul Desktop: {exc}")
+
     def _info(self, title: str, message: str) -> None:
         from tkinter import messagebox
 
@@ -849,6 +953,14 @@ def run_dashboard(initial_tab: str | None = None) -> int:
         )
         return EXIT_MISSING_DEPENDENCY
 
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"{APP_NAME}.MeetingScribe.{APP_VERSION}")
+        except Exception:
+            pass
+
     instance = SingleInstance(DASHBOARD_MUTEX_NAME)
     if not instance.acquire():
         focus_window_by_title(DASHBOARD_TITLE)
@@ -859,6 +971,14 @@ def run_dashboard(initial_tab: str | None = None) -> int:
         if APP_ICON_PATH.exists():
             try:
                 root.iconbitmap(default=str(APP_ICON_PATH))
+                root.iconbitmap(str(APP_ICON_PATH))
+            except Exception:
+                pass
+        logo_png = APP_ICON_PATH.parent / "logo_64.png"
+        if logo_png.exists():
+            try:
+                photo = tk.PhotoImage(file=str(logo_png))
+                root.iconphoto(True, photo)
             except Exception:
                 pass
         try:

@@ -45,7 +45,7 @@ def test_settings_roundtrip_validation_and_restart_fields(tmp_path: Path) -> Non
         {
             "ollama": {"detail_level": "massimo", "num_ctx": "24576", "temperature": "0,3"},
             "whisper": {"model": "large-v3-turbo", "cpu_threads": 99},
-            "output": {"user_display_name": " Andrea ", "glossary": "ACR, RS256\nSnam"},
+            "output": {"user_display_name": " Andrea ", "glossary": "ACR, RS256\nSnam", "generate_recap_email": False},
             "detection": {"use_mic_signal": "false"},
         },
         defaults,
@@ -57,6 +57,7 @@ def test_settings_roundtrip_validation_and_restart_fields(tmp_path: Path) -> Non
     assert updated.whisper.cpu_threads == defaults.whisper.cpu_threads
     assert updated.output.user_display_name == "Andrea"
     assert updated.output.glossary == "ACR, RS256\nSnam"
+    assert updated.output.generate_recap_email is False
     assert updated.detection.use_mic_signal is False
     assert len(problems) == 1 and "Thread CPU Whisper" in problems[0]
 
@@ -100,7 +101,7 @@ def test_all_settings_fields_have_help_text_and_dashboard_renders_them(tmp_path:
             assert help_text, f"Campo {group_field.name}.{item.name} privo di help_text"
             assert len(help_text) >= 20, f"help_text troppo breve per {group_field.name}.{item.name}"
 
-    assert total_fields == 26
+    assert total_fields == 27
 
     try:
         import tkinter as tk
@@ -123,7 +124,7 @@ def test_all_settings_fields_have_help_text_and_dashboard_renders_them(tmp_path:
                                     txt = w.cget("text")
                                     if txt:
                                         rendered_help.append(txt)
-        assert len(rendered_help) == 26
+        assert len(rendered_help) == 27
         app._setting_vars.clear()
     finally:
         root.destroy()

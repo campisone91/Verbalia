@@ -180,6 +180,12 @@ python main.py
 
 Il comando `python main.py --setup-only` esegue la verifica completa dell'ambiente, installa i pacchetti Python richiesti, configura FFmpeg, verifica il servizio Ollama, scarica il modello LLM e valida l'inizializzazione di Whisper salvando il marker `.env_ready.json`.
 
+### Avvio Senza Terminale (Desktop Nativo)
+Verbalia può essere avviata in background senza alcuna finestra di terminale:
+- **Doppio clic su `Verbalia.vbs`**: avvia istantaneamente l'applicazione in background (senza prompt o terminale).
+- **Icona sul Desktop**: eseguire `python tools/create_shortcut.py` o premere il pulsante **"Crea icona sul Desktop"** nella scheda *Impostazioni* del Cruscotto per creare il collegamento Windows con l'icona ufficiale del programma.
+
+
 ---
 
 ## 8. Utilizzo con Virtual Environment (Facoltativo ma Consigliato)
@@ -209,7 +215,7 @@ Tutte le modalità operative principali sono mutuamente esclusive:
 | `python main.py --test-pipeline <audio_file>` | Esegue l'intera pipeline reale (split chunk, FFmpeg, Whisper, Merge, Ollama MAP/REDUCE, DOCX, validazione e cleanup) su una copia del file audio indicato senza mai modificare o cancellare l'originale. |
 | `python main.py --dry-run` | Esegue un test completo dell'architettura (State Machine, Tray, chunk sintetici, transcript sintetico, MAP/REDUCE sintetici, generazione e validazione reale del `.docx` e cleanup) senza aprire microfono, loopback, Teams, Outlook, Whisper o Ollama. |
 | `python main.py --diagnostics` | Stampa a schermo un report diagnostico completo dell'ambiente hardware/software (compresa la quota del modello LLM su GPU) senza esporre dati sensibili. |
-| `python main.py --dashboard [--tab cruscotto\|storico\|impostazioni]` | Apre il cruscotto Tkinter in una finestra separata (istanza singola). Lo stesso cruscotto si apre dalla tray con "Apri Cruscotto" e "Impostazioni". |
+| `python main.py --dashboard [--tab cruscotto\|storico\|impostazioni]` | Apre il cruscotto Tkinter in una finestra separata (istanza singola: stato in tempo reale, arresto elaborazioni, copia rapida bozza mail, storico e impostazioni). Lo stesso cruscotto si apre dalla tray con "Apri Cruscotto" e "Impostazioni". |
 
 `--auto` e `--record-now` usano un mutex di sistema (`Local\Verbalia`): una seconda istanza registrante viene rifiutata.
 

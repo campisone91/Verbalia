@@ -44,7 +44,7 @@ JOB_STATUS_LABELS_IT: dict[str, str] = {
     JOB_COMPLETED: "Completato",
     JOB_FAILED: "Errore (nuovo tentativo)",
     JOB_PARKED: "Fermo: serve Riprova",
-    JOB_INTERRUPTED: "Interrotto (ripresa al riavvio)",
+    JOB_INTERRUPTED: "Interrotto (serve Riprova)",
 }
 
 _JOB_COLUMNS: tuple[str, ...] = (

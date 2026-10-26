@@ -26,6 +26,18 @@ EXIT_BOOTSTRAP_FAILED: int = 3
 EXIT_MISSING_DEPENDENCY: int = 4
 
 PROJECT_ROOT: Path = pathlib.Path(__file__).resolve().parent
+
+# Sanitizzazione stream quando eseguito con pythonw.exe (dove stdout e stderr sono None)
+if sys.stdout is None:
+    sys.stdout = open(os.devnull, "w", encoding="utf-8")
+if sys.stderr is None:
+    try:
+        _early_log = PROJECT_ROOT / "logs" / "bootstrap_headless.log"
+        _early_log.parent.mkdir(parents=True, exist_ok=True)
+        sys.stderr = open(_early_log, "a", encoding="utf-8")
+    except Exception:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+
 REQUIREMENTS_PATH: Path = PROJECT_ROOT / "requirements.txt"
 ENV_MARKER_PATH: Path = PROJECT_ROOT / ".env_ready.json"
 

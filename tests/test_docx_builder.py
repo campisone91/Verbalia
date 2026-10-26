@@ -273,3 +273,34 @@ def test_docx_builder_rejects_empty_files_and_parses_action_bullets(
     assert p == "Media"
 
 
+def test_docx_builder_without_recap_email(
+    tmp_path: Path,
+    fixed_now: datetime,
+    sample_metadata: MeetingMetadata,
+    valid_detailed_minutes_markdown: str,
+) -> None:
+    """Verifica che il builder generi correttamente il DOCX senza la Parte 1 quando recap_email_path è None."""
+    minutes_path = tmp_path / "detailed_minutes.md"
+    minutes_path.write_text(valid_detailed_minutes_markdown, encoding="utf-8")
+
+    output_dir = tmp_path / "output"
+    builder = MeetingDocxBuilder()
+    docx_path = builder.build(
+        metadata=sample_metadata,
+        started_at=fixed_now,
+        ended_at=fixed_now + timedelta(minutes=30),
+        recap_email_path=None,
+        detailed_minutes_path=minutes_path,
+        output_dir=output_dir,
+    )
+
+    assert docx_path.exists()
+    validate_docx_file(docx_path, require_recap_email=False)
+
+    doc = docx.Document(str(docx_path))
+    full_text = "\n".join(p.text for p in doc.paragraphs)
+    assert PART1_HEADING not in full_text
+    assert PART2_HEADING in full_text
+
+
+

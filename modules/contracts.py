@@ -84,6 +84,7 @@ class UiCommandType(str, Enum):
     OPEN_LOG = "open_log"
     OPEN_DASHBOARD = "open_dashboard"
     RETRY_JOB = "retry_job"
+    CANCEL_JOB = "cancel_job"
     EXIT = "exit"
 
 
@@ -264,6 +265,10 @@ class ShutdownRequested(ScribeError):
 
 class SessionLockedError(ScribeError):
     """La directory di sessione è già in uso da un altro processo o worker."""
+
+
+class JobCancelledError(ScribeError):
+    """Segnala che il job in elaborazione è stato interrotto su richiesta dell'utente."""
 
 
 # 11. Protocol condivisi

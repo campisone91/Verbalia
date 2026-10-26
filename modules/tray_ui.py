@@ -14,7 +14,7 @@ try:
 except ImportError:  # pragma: no cover
     pystray = None
 
-from config import APP_NAME, LOG_DIR, OUTPUT_DIR
+from config import APP_NAME, ASSETS_DIR, LOG_DIR, OUTPUT_DIR
 from modules.contracts import Stage, StageUpdate, UiCommandType, now_tz
 from modules.logging_setup import get_logger, sanitize_for_log
 
@@ -170,71 +170,110 @@ def create_stage_icon_image(
     size: int = 64,
     badge_count: int | None = None,
 ) -> Image.Image:
-    """Genera un'icona RGBA 64x64 con indicatori visivi specifici per lo Stage indicato."""
+    """Genera un'icona RGBA 64x64 basata sul logo ufficiale con indicatori per lo Stage indicato."""
     dim = max(16, int(size))
-    image = Image.new("RGBA", (dim, dim), (0, 0, 0, 0))
+    logo_path = ASSETS_DIR / "logo_64.png"
+    has_logo = False
+    if logo_path.is_file():
+        try:
+            base_logo = Image.open(logo_path).convert("RGBA")
+            if base_logo.size != (dim, dim):
+                base_logo = base_logo.resize((dim, dim), Image.Resampling.LANCZOS)
+            image = base_logo
+            has_logo = True
+        except Exception:
+            image = Image.new("RGBA", (dim, dim), (0, 0, 0, 0))
+    else:
+        image = Image.new("RGBA", (dim, dim), (0, 0, 0, 0))
+
     draw = ImageDraw.Draw(image)
-
     palette = STAGE_COLORS.get(stage, STAGE_COLORS[Stage.IDLE])
-    fill_color = palette["fill"]
-    border_color = palette["border"]
 
-    margin = max(2, dim // 10)
-    bbox = (margin, margin, dim - margin - 1, dim - margin - 1)
-    border_width = max(2, dim // 16)
+    if not has_logo:
+        fill_color = palette["fill"]
+        border_color = palette["border"]
 
-    draw.ellipse(
-        bbox,
-        fill=fill_color,
-        outline=border_color,
-        width=border_width,
-    )
+        margin = max(2, dim // 10)
+        bbox = (margin, margin, dim - margin - 1, dim - margin - 1)
+        border_width = max(2, dim // 16)
 
-    ring_color = palette.get("ring")
-    if ring_color:
-        ring_margin = margin + border_width + max(2, dim // 16)
-        ring_bbox = (
-            ring_margin,
-            ring_margin,
-            dim - ring_margin - 1,
-            dim - ring_margin - 1,
-        )
         draw.ellipse(
-            ring_bbox,
-            outline=ring_color,
-            width=max(2, dim // 14),
-        )
-
-    badge_color = palette.get("badge")
-    if badge_color:
-        badge_radius = max(4, dim // 6)
-        badge_center_x = dim - margin - badge_radius
-        badge_center_y = dim - margin - badge_radius
-        badge_bbox = (
-            badge_center_x - badge_radius,
-            badge_center_y - badge_radius,
-            badge_center_x + badge_radius,
-            badge_center_y + badge_radius,
-        )
-        draw.ellipse(
-            badge_bbox,
-            fill=badge_color,
+            bbox,
+            fill=fill_color,
             outline=border_color,
-            width=max(1, border_width // 2),
+            width=border_width,
         )
 
-    symbol_color = palette.get("symbol", "#FFFFFF")
-    stroke = max(3, dim // 12)
-    if stage == Stage.COMPLETED:
-        p1 = (int(dim * 0.28), int(dim * 0.52))
-        p2 = (int(dim * 0.44), int(dim * 0.68))
-        p3 = (int(dim * 0.72), int(dim * 0.34))
-        draw.line([p1, p2, p3], fill=symbol_color, width=stroke)
-    elif stage == Stage.ERROR:
-        offset = int(dim * 0.30)
-        end = dim - offset - 1
-        draw.line([(offset, offset), (end, end)], fill=symbol_color, width=stroke)
-        draw.line([(offset, end), (end, offset)], fill=symbol_color, width=stroke)
+        ring_color = palette.get("ring")
+        if ring_color:
+            ring_margin = margin + border_width + max(2, dim // 16)
+            ring_bbox = (
+                ring_margin,
+                ring_margin,
+                dim - ring_margin - 1,
+                dim - ring_margin - 1,
+            )
+            draw.ellipse(
+                ring_bbox,
+                outline=ring_color,
+                width=max(2, dim // 14),
+            )
+
+        badge_color = palette.get("badge")
+        if badge_color:
+            badge_radius = max(4, dim // 6)
+            badge_center_x = dim - margin - badge_radius
+            badge_center_y = dim - margin - badge_radius
+            badge_bbox = (
+                badge_center_x - badge_radius,
+                badge_center_y - badge_radius,
+                badge_center_x + badge_radius,
+                badge_center_y + badge_radius,
+            )
+            draw.ellipse(
+                badge_bbox,
+                fill=badge_color,
+                outline=border_color,
+                width=max(1, border_width // 2),
+            )
+
+        symbol_color = palette.get("symbol", "#FFFFFF")
+        stroke = max(3, dim // 12)
+        if stage == Stage.COMPLETED:
+            p1 = (int(dim * 0.28), int(dim * 0.52))
+            p2 = (int(dim * 0.44), int(dim * 0.68))
+            p3 = (int(dim * 0.72), int(dim * 0.34))
+            draw.line([p1, p2, p3], fill=symbol_color, width=stroke)
+        elif stage == Stage.ERROR:
+            offset = int(dim * 0.30)
+            end = dim - offset - 1
+            draw.line([(offset, offset), (end, end)], fill=symbol_color, width=stroke)
+            draw.line([(offset, end), (end, offset)], fill=symbol_color, width=stroke)
+    elif stage != Stage.IDLE:
+        badge_radius = max(6, int(dim * 0.24))
+        cx = dim - badge_radius - 2
+        cy = dim - badge_radius - 2
+        bbox = (cx - badge_radius, cy - badge_radius, cx + badge_radius, cy + badge_radius)
+        fill_color = palette["fill"]
+        border_color = palette["border"]
+        draw.ellipse(bbox, fill=fill_color, outline=border_color, width=max(1, dim // 24))
+
+        ring_color = palette.get("ring")
+        if ring_color:
+            r_rad = max(4, badge_radius - 3)
+            r_bbox = (cx - r_rad, cy - r_rad, cx + r_rad, cy + r_rad)
+            draw.ellipse(r_bbox, outline=ring_color, width=max(1, dim // 28))
+
+        symbol_color = palette.get("symbol", "#FFFFFF")
+        if stage == Stage.COMPLETED:
+            p1 = (int(cx - badge_radius * 0.45), int(cy))
+            p2 = (int(cx - badge_radius * 0.1), int(cy + badge_radius * 0.45))
+            p3 = (int(cx + badge_radius * 0.45), int(cy - badge_radius * 0.35))
+            draw.line([p1, p2, p3], fill=symbol_color, width=max(2, dim // 24))
+        elif stage == Stage.ERROR:
+            off = int(badge_radius * 0.45)
+            draw.line([(cx - off, cy - off), (cx + off, cy + off)], fill=symbol_color, width=max(2, dim // 24))
+            draw.line([(cx - off, cy + off), (cx + off, cy - off)], fill=symbol_color, width=max(2, dim // 24))
 
     if badge_count is not None and badge_count > 0:
         _draw_queue_badge(image, badge_count)
