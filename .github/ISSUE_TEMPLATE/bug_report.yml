@@ -1,0 +1,56 @@
+name: Segnalazione Bug
+description: Segnala un malfunzionamento tecnico senza includere audio o trascrizioni reali
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        > **ATTENZIONE PRIVACY**: Non allegare mai file audio reali (`.wav`, `.mp3`), trascrizioni di riunioni (`chunk_*.txt`, `merged_transcript.txt`), verbali `.docx` o nomi/email di partecipanti reali.
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Descrizione del problema
+      description: Spiega in modo chiaro e conciso cosa è successo e quale comportamento ti aspettavi.
+      placeholder: Durante l'esecuzione di... si è verificato...
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Passaggi per riprodurre
+      description: Elenca i comandi o le azioni eseguite per riprodurre il problema.
+      placeholder: |
+        1. Avvia con `python main.py --dry-run`
+        2. Clicca su...
+        3. Osserva l'errore...
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Output di `python main.py --diagnostics`
+      description: Incolla l'output del comando diagnostico (verifica di aver rimosso eventuali percorsi utente riservati).
+      render: powershell
+    validations:
+      required: false
+
+  - type: input
+    id: environment
+    attributes:
+      label: Ambiente (Windows, Python, GPU)
+      description: Specifica versione di Windows, versione Python e presenza eventuale di GPU NVIDIA.
+      placeholder: "Windows 11 23H2, Python 3.11.8, RTX 4060 / solo CPU"
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: privacy_check
+    attributes:
+      label: Conferma riservatezza dati
+      options:
+        - label: Confermo che questa segnalazione NON contiene audio reali, trascrizioni reali né dati personali/aziendali riservati.
+          required: true

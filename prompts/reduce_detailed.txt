@@ -1,0 +1,48 @@
+PROMPT_VERSION: 2
+PROMPT_NAME: reduce_detailed
+Stai completando il verbale di una riunione aziendale in lingua italiana. Il resoconto narrativo dettagliato, argomento per argomento, è già stato scritto e verrà inserito nel verbale così com'è: NON riscriverlo e non riassumerlo di nuovo. Il tuo compito è produrre la sintesi esecutiva e consolidare le liste estratte dai singoli blocchi temporali.
+
+=== REGOLE ===
+1. Non inventare nulla che non sia presente nel materiale fornito.
+2. Consolida i duplicati tra blocchi: una decisione o un'azione ripetuta va riportata una sola volta, nella forma più completa.
+3. Se una decisione o un'azione viene modificata in un blocco successivo, vale la versione più recente; se il cambiamento è rilevante, indicane l'evoluzione.
+4. Segnala le contraddizioni non risolte tra blocchi nella sezione Questioni aperte.
+5. Conserva i dettagli tecnici: codici, numeri, date, metriche, sistemi.
+6. Non attribuire compiti o dichiarazioni a persone non attestate con certezza: usa "Da assegnare", "Da confermare" e "Non specificata" quando un dato non è esplicito. La traccia [IO] è {{USER_NAME}}.
+7. Riporta tutte le decisioni, le questioni aperte, i rischi e le azioni presenti nel materiale: la completezza è importante quanto la sintesi.
+
+=== DATI DELLA RIUNIONE ===
+Titolo: {{MEETING_TITLE}}
+Durata della registrazione: {{MEETING_DURATION}}
+{{MEETING_METADATA}}
+{{GLOSSARY_SECTION}}
+=== MATERIALE ESTRATTO DAI BLOCCHI TEMPORALI ===
+{{MAP_BLOCKS}}
+
+=== FORMATO DI OUTPUT OBBLIGATORIO ===
+Rispondi solo in italiano, con queste sezioni Markdown di secondo livello (`##`) in quest'ordine:
+
+## Executive Summary
+10-15 righe di prosa: obiettivo della riunione, temi principali nell'ordine in cui sono stati trattati, esiti raggiunti, punti rimasti aperti e prossimi passi.
+
+## Decisioni
+- <Decisione confermata, con condizioni ed eventuale evoluzione.> (Se non ce ne sono: "Non sono state verbalizzate decisioni definitive.")
+
+## Questioni aperte
+- <Punto in sospeso, proposta da validare o contraddizione non risolta.>
+
+## Rischi
+- <Rischio tecnico, operativo o di pianificazione.> (Se non ce ne sono: "Nessun rischio segnalato.")
+
+## Dipendenze
+- <Dipendenza da team, sistemi, fornitori o attività esterne.> (Se non ce ne sono: "Nessuna dipendenza segnalata.")
+
+## Action Items
+Riporta le azioni solo in questa tabella Markdown, una riga per azione, senza inventare righe:
+
+| Responsabile | Task / Azione | Priorità | Scadenza / Note |
+| --- | --- | --- | --- |
+| Da assegnare | Descrizione precisa del task | Media | Non specificata |
+
+Se non è emersa alcuna azione, scrivi esattamente:
+Non sono emersi Action Items espliciti.

@@ -1,0 +1,48 @@
+name: Security
+
+on:
+  push:
+    branches: ["main", "master"]
+  pull_request:
+    branches: ["main", "master"]
+  schedule:
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  codeql:
+    name: CodeQL Python Analysis
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: python
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  repository-hygiene:
+    name: Sensitive Artifact Hygiene Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Verify no real audio, transcripts or models are tracked
+        shell: bash
+        run: |
+          set -euo pipefail
+          FORBIDDEN=$(git ls-files | grep -E '\.(wav|mp3|m4a|flac|ogg|docx|pt|bin|gguf)$' || true)
+          if [ -n "$FORBIDDEN" ]; then
+            echo "Errore: file binari o artefatti sensibili tracciati nel repository:"
+            echo "$FORBIDDEN"
+            exit 1
+          fi

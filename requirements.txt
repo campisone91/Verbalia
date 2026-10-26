@@ -1,0 +1,10 @@
+PyAudioWPatch>=0.2.12.6,<0.3
+pycaw>=20240210
+comtypes>=1.4.0,<2.0.0
+psutil>=5.9.8,<8.0.0
+faster-whisper>=1.0.3,<2.0.0
+requests>=2.31.0,<3.0.0
+python-docx>=1.1.0,<2.0.0
+pywin32>=306; sys_platform == "win32"
+pystray>=0.19.5,<1.0.0
+Pillow>=10.0.0,<13.0.0

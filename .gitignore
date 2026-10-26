@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.so
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test and tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+
+# Runtime
+.env_ready.json
+.env_ready.corrupt.*.json
+.user_consent.json
+
+bin/*
+!bin/.gitkeep
+
+logs/*
+!logs/.gitkeep
+
+temp/*
+!temp/.gitkeep
+
+output/*
+!output/.gitkeep
+
+data/*
+!data/.gitkeep
+settings.json
+
+# Sensitive artifacts
+*.wav
+*.mp3
+*.m4a
+*.flac
+*.ogg
+*.docx
+
+state.json
+state.json.tmp
+map_block_*.md
+map_block_*.meta.json
+rolling_context_*.md
+merged_transcript.txt
+chunk_*.txt
+chunk_*.json
+
+# Models and caches
+models/
+.cache/
+
+# Windows
+Thumbs.db
+Desktop.ini

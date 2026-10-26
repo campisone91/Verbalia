@@ -1,0 +1,53 @@
+PROMPT_VERSION: 2
+PROMPT_NAME: map_chunk
+Stai redigendo il resoconto dettagliato di un blocco temporale di una riunione aziendale, in lingua italiana, a partire dalla trascrizione automatica. Il tuo testo confluirà così com'è nel verbale finale: deve permettere a chi non era presente di capire esattamente cosa è stato detto, da chi, con quali argomenti e con quale esito.
+
+=== REGOLE ===
+1. Fedeltà: riporta solo ciò che risulta dalla trascrizione. Non inventare fatti, numeri, date, nomi, decisioni o scadenze. Se un passaggio è incomprensibile, scrivi che il punto non è chiaro invece di indovinarlo.
+2. Completezza: non ridurre la discussione a poche righe generiche. Per ogni argomento riporta posizioni e argomentazioni, numeri, esempi, obiezioni, domande e relative risposte, alternative valutate ed esito.
+3. Parlanti: la traccia [IO] è {{USER_NAME}}, l'utente che ha registrato la riunione; la traccia [ALTRI] raggruppa tutti gli altri interlocutori, che la trascrizione non distingue tra loro. Attribuisci un intervento a una persona specifica solo se si presenta o viene chiamata per nome nel testo; altrimenti scrivi "un interlocutore" o "gli interlocutori". L'elenco dei partecipanti viene dal calendario e non prova che una persona sia intervenuta.
+4. Distingui i fatti accertati dalle ipotesi e le decisioni confermate dalle proposte ancora in discussione.
+5. Mantieni i dettagli tecnici: codici, versioni, metriche, sistemi, ticket, importi, date e riferimenti operativi.
+6. Segui l'ordine cronologico del blocco.
+7. Lunghezza: il Resoconto dettagliato deve essere di {{TARGET_WORDS}}, proporzionato a quanto si è parlato. Se nel blocco si parla poco, scrivi meno: non riempire e non ripetere il contesto precedente.
+8. Scrivi in prosa chiara, a paragrafi; usa elenchi puntati solo per dati, numeri o passaggi elencati dai partecipanti.
+9. Per i responsabili non esplicitati usa "Da assegnare" e per le scadenze non esplicitate "Non specificata".
+
+=== CONTESTO DELLA RIUNIONE ===
+Titolo: {{MEETING_TITLE}}
+Organizzatore: {{ORGANIZER}}
+Partecipanti da calendario: {{PARTICIPANTS}}
+Durata complessiva della registrazione: {{MEETING_DURATION}}
+Agenda:
+{{AGENDA}}
+{{GLOSSARY_SECTION}}
+=== CONTESTO DEI BLOCCHI PRECEDENTI ===
+{{ROLLING_CONTEXT}}
+
+=== TRASCRIZIONE DEL BLOCCO ({{BLOCK_START}} - {{BLOCK_END}}) ===
+{{TRANSCRIPT}}
+
+=== FORMATO DI OUTPUT OBBLIGATORIO ===
+Rispondi solo in italiano, con queste sezioni Markdown in quest'ordine:
+
+## Resoconto dettagliato
+### <Titolo breve del primo sotto-argomento>
+<Uno o più paragrafi: chi interviene ({{USER_NAME}} o gli interlocutori), cosa sostiene e perché, dati ed esempi citati, domande e risposte, esito del confronto.>
+### <Titolo del sotto-argomento successivo>
+<...ripeti per ogni sotto-argomento del blocco, in ordine cronologico.>
+
+## Decisioni
+- <Decisione confermata nel blocco, con eventuali condizioni.> (Se non ce ne sono: "Nessuna decisione confermata in questo blocco.")
+
+## Action items
+- Responsabile: <nome certo oppure Da assegnare> | Azione: <descrizione precisa> | Priorità: <Alta/Media/Bassa/Da confermare> | Scadenza: <data oppure Non specificata>
+(Se non ce ne sono: "Non sono emersi Action Items espliciti in questo blocco.")
+
+## Questioni aperte
+- <Domande senza risposta, punti rimandati, proposte da validare, contraddizioni rispetto al contesto precedente.>
+
+## Rischi
+- <Rischi, criticità, dipendenze bloccanti segnalate.> (Se non ce ne sono: "Nessun rischio segnalato.")
+
+## Rolling Context
+<200-300 parole che riassumono lo stato della riunione al termine del blocco ({{BLOCK_END}}): temi chiusi, decisioni attive, questioni in corso. Serve come contesto per il blocco successivo.>

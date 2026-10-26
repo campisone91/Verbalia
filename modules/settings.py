@@ -1,0 +1,377 @@
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass, field, fields, replace
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+import config as _config
+from modules.contracts import atomic_write_json
+from modules.logging_setup import get_logger
+
+if TYPE_CHECKING:
+    from modules.summarizer import SummarizerOptions
+
+logger = get_logger("settings")
+
+SETTINGS_PATH_ENV_VAR: str = "TEAMS_SCRIBE_SETTINGS_PATH"
+SETTINGS_SCHEMA_VERSION: int = 1
+
+WHISPER_MODEL_CHOICES: tuple[str, ...] = ("medium", "large-v3-turbo", "small", "large-v3")
+DETAIL_LEVEL_CHOICES: tuple[str, ...] = ("standard", "dettagliato", "massimo")
+PARALLEL_POLICY_CHOICES: tuple[str, ...] = ("auto", "sequential", "parallel")
+
+
+def _spec(
+    label: str,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    choices: tuple[str, ...] | None = None,
+    restart: bool = False,
+    help_text: str = "",
+) -> dict[str, Any]:
+    """Metadati di un campo: usati sia per la validazione sia per costruire il form del cruscotto."""
+    return {
+        "label": label,
+        "min": minimum,
+        "max": maximum,
+        "choices": choices,
+        "restart": restart,
+        "help": help_text,
+    }
+
+
+@dataclass(frozen=True, slots=True)
+class DetectionSettings:
+    start_debounce_sec: int = field(
+        default=20, metadata=_spec("Debounce avvio (s)", minimum=0, maximum=300)
+    )
+    stop_grace_period_sec: int = field(
+        default=90, metadata=_spec("Grace period chiusura (s)", minimum=0, maximum=1800)
+    )
+    outlook_match_tolerance_min: int = field(
+        default=10, metadata=_spec("Tolleranza abbinamento Outlook (min)", minimum=0, maximum=60)
+    )
+    use_mic_signal: bool = field(
+        default=True, metadata=_spec("Usa segnale microfono in uso da Teams")
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AudioSettings:
+    chunk_duration_sec: int = field(
+        default=900, metadata=_spec("Durata chunk audio (s)", minimum=60, maximum=3600)
+    )
+    max_session_duration_sec: int = field(
+        default=14400, metadata=_spec("Durata massima registrazione (s)", minimum=600, maximum=43200)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class WhisperSettings:
+    model: str = field(
+        default="medium",
+        metadata=_spec("Modello Whisper (CPU)", choices=WHISPER_MODEL_CHOICES, restart=True),
+    )
+    cpu_threads: int = field(
+        default=6, metadata=_spec("Thread CPU Whisper", minimum=1, maximum=32, restart=True)
+    )
+    beam_size: int = field(default=5, metadata=_spec("Beam size", minimum=1, maximum=10))
+    language: str = field(default="it", metadata=_spec("Lingua"))
+
+
+@dataclass(frozen=True, slots=True)
+class OllamaSettings:
+    base_url: str = field(default="http://localhost:11434", metadata=_spec("URL Ollama"))
+    model: str = field(default="llama3.1:8b", metadata=_spec("Modello LLM"))
+    num_ctx: int = field(
+        default=16384, metadata=_spec("Contesto (num_ctx)", minimum=4096, maximum=131072)
+    )
+    num_predict_map: int = field(
+        default=3072, metadata=_spec("Token massimi per blocco MAP", minimum=256, maximum=16384)
+    )
+    num_predict_reduce: int = field(
+        default=4096, metadata=_spec("Token massimi REDUCE", minimum=256, maximum=16384)
+    )
+    temperature: float = field(
+        default=0.2, metadata=_spec("Temperature", minimum=0.0, maximum=2.0)
+    )
+    read_timeout_sec: int = field(
+        default=300,
+        metadata=_spec(
+            "Timeout tra due chunk di risposta (s)",
+            minimum=30,
+            maximum=3600,
+        ),
+    )
+    keep_alive: str = field(default="10m", metadata=_spec("Keep alive modello"))
+    map_block_duration_sec: int = field(
+        default=600, metadata=_spec("Durata blocco MAP (s)", minimum=120, maximum=3600)
+    )
+    detail_level: str = field(
+        default="dettagliato",
+        metadata=_spec("Livello di dettaglio del resoconto", choices=DETAIL_LEVEL_CHOICES),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class OutputSettings:
+    output_dir: str = field(
+        default="",
+        metadata=_spec(
+            "Cartella output (vuoto = predefinita)",
+            restart=True,
+            help_text="Cartella in cui vengono salvati i verbali Word.",
+        ),
+    )
+    organize_by_day: bool = field(default=True, metadata=_spec("Organizza per giorno"))
+    include_transcript: bool = field(
+        default=True, metadata=_spec("Trascrizione integrale in appendice")
+    )
+    user_display_name: str = field(
+        default="", metadata=_spec("Nome utente per la traccia IO")
+    )
+    glossary: str = field(
+        default="",
+        metadata=_spec(
+            "Glossario (termini separati da virgola o uno per riga)",
+            help_text="Usato come initial prompt di Whisper e nei prompt LLM; vuoto = omesso.",
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ExecutionSettings:
+    parallel_policy: str = field(
+        default="auto",
+        metadata=_spec(
+            "Esecuzione Whisper/LLM",
+            choices=PARALLEL_POLICY_CHOICES,
+            restart=True,
+            help_text="auto = in parallelo solo se il modello LLM risulta caricato su GPU.",
+        ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class AppSettings:
+    detection: DetectionSettings = field(default_factory=DetectionSettings)
+    audio: AudioSettings = field(default_factory=AudioSettings)
+    whisper: WhisperSettings = field(default_factory=WhisperSettings)
+    ollama: OllamaSettings = field(default_factory=OllamaSettings)
+    output: OutputSettings = field(default_factory=OutputSettings)
+    execution: ExecutionSettings = field(default_factory=ExecutionSettings)
+
+
+SETTINGS_GROUP_LABELS: dict[str, str] = {
+    "detection": "Rilevamento",
+    "audio": "Audio",
+    "whisper": "Whisper",
+    "ollama": "Ollama",
+    "output": "Output",
+    "execution": "Esecuzione",
+}
+
+
+def resolve_settings_path(path: Path | None = None) -> Path:
+    """Percorso di settings.json: argomento, variabile d'ambiente o default di config."""
+    if path is not None:
+        return path
+    env_path = os.environ.get(SETTINGS_PATH_ENV_VAR, "").strip()
+    if env_path:
+        return Path(env_path)
+    return _config.SETTINGS_PATH
+
+
+def default_settings() -> AppSettings:
+    """Default letti da config al momento della chiamata (non all'import)."""
+    return AppSettings(
+        detection=DetectionSettings(
+            start_debounce_sec=int(_config.START_DEBOUNCE_SEC),
+            stop_grace_period_sec=int(_config.STOP_GRACE_PERIOD_SEC),
+            outlook_match_tolerance_min=int(_config.OUTLOOK_MATCH_TOLERANCE_MIN),
+            use_mic_signal=bool(_config.WATCHER_USE_MIC_SIGNAL),
+        ),
+        audio=AudioSettings(
+            chunk_duration_sec=int(_config.CHUNK_DURATION_SEC),
+            max_session_duration_sec=int(_config.MAX_SESSION_DURATION_SEC),
+        ),
+        whisper=WhisperSettings(
+            model=str(_config.WHISPER_CPU_MODEL),
+            cpu_threads=int(_config.WHISPER_CPU_THREADS),
+            beam_size=int(_config.WHISPER_BEAM_SIZE),
+            language=str(_config.WHISPER_LANGUAGE),
+        ),
+        ollama=OllamaSettings(
+            base_url=str(_config.OLLAMA_BASE_URL),
+            model=str(_config.OLLAMA_MODEL),
+            num_ctx=int(_config.OLLAMA_NUM_CTX),
+            num_predict_map=int(_config.OLLAMA_NUM_PREDICT_MAP),
+            num_predict_reduce=int(_config.OLLAMA_NUM_PREDICT_REDUCE),
+            temperature=float(_config.OLLAMA_TEMPERATURE),
+            read_timeout_sec=int(_config.OLLAMA_READ_TIMEOUT_SEC),
+            keep_alive=str(_config.OLLAMA_KEEP_ALIVE),
+            map_block_duration_sec=int(_config.MAP_BLOCK_DURATION_SEC),
+            detail_level=str(_config.OLLAMA_DETAIL_LEVEL),
+        ),
+        output=OutputSettings(
+            output_dir="",
+            organize_by_day=bool(_config.OUTPUT_ORGANIZE_BY_DAY),
+            include_transcript=bool(_config.DOCX_INCLUDE_TRANSCRIPT),
+            user_display_name=str(_config.USER_DISPLAY_NAME),
+            glossary=str(_config.CUSTOM_GLOSSARY),
+        ),
+        execution=ExecutionSettings(parallel_policy=str(_config.AI_PARALLEL_POLICY)),
+    )
+
+
+def settings_to_dict(settings: AppSettings) -> dict[str, object]:
+    """Serializza le impostazioni in un dizionario JSON-compatibile a gruppi."""
+    payload: dict[str, object] = {"schema_version": SETTINGS_SCHEMA_VERSION}
+    for group_field in fields(settings):
+        group = getattr(settings, group_field.name)
+        payload[group_field.name] = {f.name: getattr(group, f.name) for f in fields(group)}
+    return payload
+
+
+def _coerce_value(raw: object, default: object, spec: dict[str, Any]) -> object:
+    """Converte e valida un singolo valore; solleva ValueError se non accettabile."""
+    if isinstance(default, bool):
+        if isinstance(raw, bool):
+            return raw
+        if isinstance(raw, str) and raw.strip().lower() in ("true", "1", "si", "sì", "yes"):
+            return True
+        if isinstance(raw, str) and raw.strip().lower() in ("false", "0", "no"):
+            return False
+        raise ValueError("atteso un valore booleano")
+    if isinstance(default, int):
+        if isinstance(raw, bool):
+            raise ValueError("atteso un intero")
+        value_int = int(float(str(raw).strip())) if isinstance(raw, str) else int(raw)  # type: ignore[call-overload]
+        if spec.get("min") is not None and value_int < spec["min"]:
+            raise ValueError(f"minimo {spec['min']}")
+        if spec.get("max") is not None and value_int > spec["max"]:
+            raise ValueError(f"massimo {spec['max']}")
+        return value_int
+    if isinstance(default, float):
+        if isinstance(raw, bool):
+            raise ValueError("atteso un numero")
+        value_float = float(str(raw).strip().replace(",", ".")) if isinstance(raw, str) else float(raw)  # type: ignore[arg-type]
+        if spec.get("min") is not None and value_float < spec["min"]:
+            raise ValueError(f"minimo {spec['min']}")
+        if spec.get("max") is not None and value_float > spec["max"]:
+            raise ValueError(f"massimo {spec['max']}")
+        return value_float
+    if not isinstance(raw, str):
+        raise ValueError("attesa una stringa")
+    value_str = raw if spec.get("label", "").startswith("Glossario") else raw.strip()
+    choices = spec.get("choices")
+    if choices and value_str not in choices:
+        raise ValueError(f"valori ammessi: {', '.join(choices)}")
+    return value_str
+
+
+def settings_from_dict(
+    payload: dict[str, object],
+    base: AppSettings | None = None,
+) -> tuple[AppSettings, list[str]]:
+    """Applica un dizionario alle impostazioni base; i valori non validi restano al default.
+
+    Restituisce le impostazioni risultanti e l'elenco dei problemi riscontrati (in italiano).
+    """
+    result = base if base is not None else default_settings()
+    problems: list[str] = []
+    for group_field in fields(result):
+        group_name = group_field.name
+        raw_group = payload.get(group_name)
+        if raw_group is None:
+            continue
+        if not isinstance(raw_group, dict):
+            problems.append(f"Gruppo '{group_name}' non valido: ignorato.")
+            continue
+        group = getattr(result, group_name)
+        updates: dict[str, object] = {}
+        for item in fields(group):
+            if item.name not in raw_group:
+                continue
+            default_value = getattr(group, item.name)
+            try:
+                updates[item.name] = _coerce_value(raw_group[item.name], default_value, dict(item.metadata))
+            except (TypeError, ValueError) as exc:
+                label = item.metadata.get("label", item.name)
+                problems.append(f"{SETTINGS_GROUP_LABELS.get(group_name, group_name)} / {label}: {exc}.")
+        if updates:
+            result = replace(result, **{group_name: replace(group, **updates)})
+    return result, problems
+
+
+def load_settings(path: Path | None = None) -> AppSettings:
+    """Carica settings.json sopra i default; file assente o corrotto = default (con warning)."""
+    target = resolve_settings_path(path)
+    defaults = default_settings()
+    if not target.is_file():
+        return defaults
+    try:
+        # utf-8-sig: il Blocco note di Windows salva con BOM
+        payload = json.loads(target.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.warning("settings.json illeggibile (%s): uso le impostazioni predefinite.", exc)
+        return defaults
+    if not isinstance(payload, dict):
+        logger.warning("settings.json non contiene un oggetto JSON: uso le impostazioni predefinite.")
+        return defaults
+    settings, problems = settings_from_dict(payload, defaults)
+    for problem in problems:
+        logger.warning("Impostazione ignorata: %s", problem)
+    return settings
+
+
+def save_settings(settings: AppSettings, path: Path | None = None) -> Path:
+    """Salva atomicamente le impostazioni in settings.json."""
+    target = resolve_settings_path(path)
+    atomic_write_json(target, settings_to_dict(settings))
+    return target
+
+
+def restart_required_fields(old: AppSettings, new: AppSettings) -> list[str]:
+    """Etichette dei campi modificati che richiedono il riavvio dell'applicazione."""
+    changed: list[str] = []
+    for group_field in fields(old):
+        old_group = getattr(old, group_field.name)
+        new_group = getattr(new, group_field.name)
+        for item in fields(old_group):
+            if item.metadata.get("restart") and getattr(old_group, item.name) != getattr(new_group, item.name):
+                changed.append(str(item.metadata.get("label", item.name)))
+    return changed
+
+
+def resolve_output_dir(settings: AppSettings) -> Path:
+    """Cartella di output effettiva (impostazione utente o default di config)."""
+    raw = settings.output.output_dir.strip()
+    return Path(raw).expanduser() if raw else _config.OUTPUT_DIR
+
+
+def to_summarizer_options(settings: AppSettings) -> SummarizerOptions:
+    """Converte le impostazioni nelle SummarizerOptions usate da un job."""
+    from modules.summarizer import SummarizerOptions, resolve_user_display_name
+    from modules.transcript_utils import resolve_glossary
+
+    return SummarizerOptions(
+        num_ctx=settings.ollama.num_ctx,
+        num_predict_map=settings.ollama.num_predict_map,
+        num_predict_reduce=settings.ollama.num_predict_reduce,
+        temperature=settings.ollama.temperature,
+        seed=int(_config.OLLAMA_SEED),
+        keep_alive=settings.ollama.keep_alive,
+        connect_timeout_sec=int(_config.OLLAMA_CONNECT_TIMEOUT_SEC),
+        read_timeout_sec=settings.ollama.read_timeout_sec,
+        max_retries=int(_config.OLLAMA_MAX_RETRIES),
+        context_safety_margin=int(_config.OLLAMA_CONTEXT_SAFETY_MARGIN),
+        map_block_duration_sec=settings.ollama.map_block_duration_sec,
+        detail_level=settings.ollama.detail_level,
+        glossary=resolve_glossary(settings.output.glossary),
+        user_name=resolve_user_display_name(settings.output.user_display_name),
+        streaming=bool(_config.OLLAMA_STREAMING),
+    )

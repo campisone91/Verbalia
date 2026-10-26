@@ -1,0 +1,29 @@
+name: Richiesta Funzionalità
+description: Proponi un miglioramento architetturale o una nuova funzionalità per Teams Meeting Scribe
+title: "[Feature]: "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Quale problema o esigenza risolve questa proposta?
+      description: Descrivi il contesto d'uso e il limite attuale.
+      placeholder: Quando utilizzo l'applicazione in modalità... sarebbe utile...
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Soluzione proposta
+      description: Descrivi il comportamento desiderato mantenendo il vincolo di elaborazione 100% locale.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternative considerate
+      description: Indica eventuali workaround o approcci alternativi valutati.
+    validations:
+      required: false

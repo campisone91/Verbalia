@@ -1,0 +1,106 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "teams-meeting-scribe"
+version = "0.1.0"
+description = "Applicazione desktop locale Windows per registrazione dual-track, trascrizione faster-whisper e verbalizzazione Ollama di call Microsoft Teams."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+    { name = "Teams Meeting Scribe Contributors" }
+]
+keywords = ["teams", "whisper", "ollama", "transcription", "minutes", "windows", "wasapi"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: End Users/Desktop",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows :: Windows 10",
+    "Operating System :: Microsoft :: Windows :: Windows 11",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "PyAudioWPatch>=0.2.12.6,<0.3",
+    "pycaw>=20240210",
+    "comtypes>=1.4.0,<2.0.0",
+    "psutil>=5.9.8,<8.0.0",
+    "faster-whisper>=1.0.3,<2.0.0",
+    "requests>=2.31.0,<3.0.0",
+    "python-docx>=1.1.0,<2.0.0",
+    "pywin32>=306; sys_platform == 'win32'",
+    "pystray>=0.19.5,<1.0.0",
+    "Pillow>=10.0.0,<13.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0,<10.0.0",
+    "pytest-cov>=5.0.0,<7.0.0",
+    "pytest-mock>=3.12.0,<4.0.0",
+    "ruff>=0.4.0,<1.0.0",
+    "mypy>=1.10.0,<2.0.0",
+    "types-requests>=2.31.0",
+]
+
+[tool.setuptools]
+py-modules = ["config", "bootstrap", "main"]
+packages = ["modules"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = [
+    ".venv",
+    "venv",
+    "bin",
+    "logs",
+    "temp",
+    "output",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = ["E501", "B009", "B010"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_unused_configs = true
+disallow_untyped_defs = false
+check_untyped_defs = true
+ignore_missing_imports = true
+no_implicit_optional = true
+warn_redundant_casts = true
+exclude = [
+    "^temp/",
+    "^output/",
+    "^logs/",
+    "^bin/",
+]
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = "-ra -q"
+markers = [
+    "hardware: test che richiede hardware o software reale (WASAPI, Outlook, GPU, Ollama)",
+    "integration: test di integrazione locale multi-modulo",
+    "slow: test lento o ad alto utilizzo di I/O",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["modules", "config", "bootstrap", "main"]
+omit = [
+    "tests/*",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true
