@@ -51,18 +51,21 @@ def test_tray_concurrent_updates_and_menu_labels(tmp_path: Path) -> None:
     assert "(2/4)" in tray.format_status_label()
 
     menu_labels = tray.get_menu_labels()
-    assert len(menu_labels) == 9
+    assert len(menu_labels) == 10
     assert menu_labels[1] == "Avvia Registrazione Manuale Ora"
     assert menu_labels[2] == "Termina Call e Genera Recap Ora"
-    assert menu_labels[3] == "Apri Cruscotto"
-    assert menu_labels[4] == "Impostazioni"
+    assert menu_labels[3] == "Pausa / Riprendi Registrazione (Ctrl+Alt+P)"
+    assert menu_labels[4] == "Apri Cruscotto"
+    assert menu_labels[5] == "Impostazioni"
     assert menu_labels[-1] == "Esci"
 
     tray._on_start_manual()
     tray._on_finalize_now()
+    tray._on_toggle_pause()
     tray._on_exit()
     assert cmd_queue.get_nowait() == UiCommandType.START_MANUAL
     assert cmd_queue.get_nowait() == UiCommandType.FINALIZE_NOW
+    assert cmd_queue.get_nowait() == UiCommandType.TOGGLE_PAUSE
     assert cmd_queue.get_nowait() == UiCommandType.EXIT
 
     # Test apertura ultimo file DOCX mancante vs esistente
@@ -100,10 +103,15 @@ def test_tray_open_helpers_and_notifications(
     tray.set_stage(Stage.IDLE)
     assert tray._can_start_manual() is True
     assert tray._can_finalize_now() is False
+    assert tray._can_toggle_pause() is False
 
     tray.set_stage(Stage.RECORDING)
     assert tray._can_start_manual() is False
     assert tray._can_finalize_now() is True
+    assert tray._can_toggle_pause() is True
+
+    tray.set_stage(Stage.PAUSED)
+    assert tray._can_toggle_pause() is True
 
     # Durante l'elaborazione di un job l'avvio manuale resta disponibile (registrazione concorrente)
     tray.set_recording_status(Stage.IDLE)

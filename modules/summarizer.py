@@ -545,6 +545,7 @@ class OllamaMapReduceSummarizer:
         self._options_override: SummarizerOptions | None = options
         self._on_progress: Callable[[int], None] | None = on_progress
         self._active_response: object | None = None
+        self._cancel_requested: threading.Event = threading.Event()
         self.last_inference_stats: dict[str, float] = {}
 
         self._session: requests.Session = (
@@ -610,6 +611,15 @@ class OllamaMapReduceSummarizer:
         """Imposta la callback che riceve il numero di token generati durante lo streaming."""
         self._on_progress = callback
 
+    def reset_cancel(self) -> None:
+        """Ripristina il flag di cancellazione prima di iniziare un nuovo job."""
+        self._cancel_requested.clear()
+
+    def cancel_current(self) -> None:
+        """Interrompe la richiesta HTTP Ollama in corso chiudendo lo stream."""
+        self._cancel_requested.set()
+        self.cancel_active_request()
+
     def cancel_active_request(self) -> None:
         """Chiude la risposta in streaming in corso (usato allo shutdown)."""
         response = self._active_response
@@ -620,10 +630,14 @@ class OllamaMapReduceSummarizer:
                 logger.debug("Chiusura della risposta Ollama in corso non riuscita: %s", exc)
 
     def _check_shutdown(self) -> None:
+        if self._cancel_requested.is_set():
+            raise OllamaError("Elaborazione Ollama annullata dall'utente.")
         if self._shutdown_event is not None and self._shutdown_event.is_set():
             raise ShutdownRequested("Esecuzione Ollama interrotta: arresto richiesto.")
 
     def _sleep_with_shutdown(self, delay_sec: float) -> None:
+        if self._cancel_requested.is_set():
+            raise OllamaError("Elaborazione Ollama annullata dall'utente.")
         if self._shutdown_event is not None:
             if self._shutdown_event.wait(timeout=max(0.0, delay_sec)):
                 raise ShutdownRequested(
@@ -714,11 +728,20 @@ class OllamaMapReduceSummarizer:
         *,
         system_prompt: str = _SYSTEM_PROMPT_ITALIAN,
         num_predict: int | None = None,
+        validation_attempt: int = 0,
+        stage: Stage = Stage.SUMMARIZING_MAP,
+        progress_detail: str = "",
     ) -> str:
         """Invia una richiesta a /api/generate con retry esponenziale e validazione risposta."""
+        del stage, progress_detail
         opts = self.options
         url = f"{self._base_url}/api/generate"
         streaming = bool(opts.streaming)
+        effective_temp = (
+            min(0.4, round(opts.temperature + 0.15 * validation_attempt, 2))
+            if validation_attempt > 0
+            else opts.temperature
+        )
         payload: dict[str, object] = {
             "model": self._model,
             "system": system_prompt,
@@ -727,7 +750,9 @@ class OllamaMapReduceSummarizer:
             "keep_alive": opts.keep_alive,
             "options": {
                 "num_ctx": opts.num_ctx,
-                "temperature": opts.temperature,
+                "temperature": effective_temp,
+                "repeat_penalty": 1.15,
+                "repeat_last_n": 256,
                 "seed": opts.seed,
                 "num_predict": int(num_predict if num_predict is not None else opts.num_predict_map),
             },
@@ -788,7 +813,13 @@ class OllamaMapReduceSummarizer:
                     requests.exceptions.Timeout,
                     requests.exceptions.ConnectionError,
                     requests.exceptions.ChunkedEncodingError,
+                    requests.exceptions.RequestException,
+                    AttributeError,
+                    ValueError,
                 ) as exc:
+                    self._check_shutdown()
+                    if isinstance(exc, AttributeError):
+                        raise OllamaError("Richiesta Ollama interrotta.") from exc
                     if self._shutdown_event is not None and self._shutdown_event.is_set():
                         raise ShutdownRequested("Richiesta Ollama annullata per arresto.") from exc
                     last_error = exc
@@ -805,10 +836,6 @@ class OllamaMapReduceSummarizer:
                         continue
                     raise OllamaError(
                         f"Connessione a Ollama fallita dopo {max_attempts} tentativi: {exc}"
-                    ) from exc
-                except requests.exceptions.RequestException as exc:
-                    raise OllamaError(
-                        f"Errore HTTP non recuperabile verso Ollama: {exc}"
                     ) from exc
                 finally:
                     self._active_response = None
@@ -851,7 +878,7 @@ class OllamaMapReduceSummarizer:
         num_predict: int | None = None,
     ) -> str:
         """Esegue la generazione, valida la struttura e tenta un singolo repair se necessario."""
-        initial_output = self._invoke_ollama(prompt, num_predict=num_predict)
+        initial_output = self._invoke_ollama(prompt, num_predict=num_predict, validation_attempt=0)
         is_valid, missing_sections = validator(initial_output)
         if is_valid:
             return initial_output
@@ -873,7 +900,7 @@ class OllamaMapReduceSummarizer:
             "=== RISPOSTA DA CORREGGERE ===\n"
             f"{initial_output}\n"
         )
-        repaired_output = self._invoke_ollama(repair_prompt, num_predict=num_predict)
+        repaired_output = self._invoke_ollama(repair_prompt, num_predict=num_predict, validation_attempt=1)
         repaired_valid, still_missing = validator(repaired_output)
         if not repaired_valid:
             raise OllamaError(
@@ -881,6 +908,8 @@ class OllamaMapReduceSummarizer:
                 f"Sezioni mancanti: {', '.join(still_missing)}"
             )
         return repaired_output
+
+    _generate_validated_markdown = _generate_with_validation_and_repair
 
     def _fit_map_prompt_within_budget(
         self,

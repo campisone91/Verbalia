@@ -3,10 +3,11 @@ from __future__ import annotations
 import math
 import subprocess
 from pathlib import Path
+from typing import Final
 
 # 8.1 Metadati
 APP_NAME: str = "Verbalia"
-APP_VERSION: str = "0.1.0"
+APP_VERSION: str = "1.0.0"
 STATE_SCHEMA_VERSION: int = 1
 MIN_PYTHON_VERSION: tuple[int, int] = (3, 10)
 
@@ -26,12 +27,42 @@ ASSETS_DIR: Path = PROJECT_ROOT / "assets"
 APP_ICON_PATH: Path = ASSETS_DIR / "icon.ico"
 APP_LOGO_PATH: Path = ASSETS_DIR / "logo.png"
 BIN_DIR: Path = PROJECT_ROOT / "bin"
+MODELS_DIR: Final[Path] = BIN_DIR / "models"
+SPEAKER_EMBEDDING_MODEL_PATH: Final[Path] = MODELS_DIR / "speaker_embedding.onnx"
+SPEAKER_CENTROIDS_FILENAME: Final[str] = "speaker_centroids.json"
 LOG_DIR: Path = PROJECT_ROOT / "logs"
 TEMP_DIR: Path = PROJECT_ROOT / "temp"
 OUTPUT_DIR: Path = PROJECT_ROOT / "output"
 DATA_DIR: Path = PROJECT_ROOT / "data"
 HISTORY_DB_PATH: Path = DATA_DIR / "history.db"
 SETTINGS_PATH: Path = PROJECT_ROOT / "settings.json"
+
+SUPPORTED_IMPORT_EXTENSIONS: Final[tuple[str, ...]] = (
+    ".wav",
+    ".mp3",
+    ".m4a",
+    ".mp4",
+    ".mkv",
+    ".ogg",
+    ".flac",
+    ".webm",
+    ".aac",
+    ".wma",
+)
+
+SESSION_DIR_PREFIX: Final[str] = "session_"
+AUDIO_WORK_SUBDIR: Final[str] = "audio"
+TRANSCRIPTS_SUBDIR: Final[str] = "transcripts"
+WHISPER_SAMPLE_RATE: Final[int] = 16000
+WHISPER_CHANNELS: Final[int] = 1
+SAMPLE_WIDTH_BYTES: Final[int] = 2
+
+DIARIZATION_ENABLED_DEFAULT: bool = True
+DIARIZATION_SIMILARITY_THRESHOLD: float = 0.68
+DIARIZATION_MAX_SPEAKERS: int = 8
+DIARIZATION_MIN_SEGMENT_SEC: Final[float] = 0.75
+PAUSE_HOTKEY_ENABLED_DEFAULT: bool = True
+PAUSE_HOTKEY_DEFAULT: Final[str] = "Ctrl+Alt+P"
 
 ENV_MARKER_PATH: Path = PROJECT_ROOT / ".env_ready.json"
 USER_CONSENT_PATH: Path = PROJECT_ROOT / ".user_consent.json"
@@ -50,6 +81,7 @@ def ensure_runtime_directories() -> None:
     for directory in (
         ASSETS_DIR,
         BIN_DIR,
+        MODELS_DIR,
         LOG_DIR,
         TEMP_DIR,
         OUTPUT_DIR,
@@ -88,6 +120,7 @@ START_DEBOUNCE_SEC: int = 20
 STOP_GRACE_PERIOD_SEC: int = 90
 WATCHER_POLL_INTERVAL_SEC: float = 1.0
 TEAMS_CONFIDENCE_THRESHOLD: float = 0.70
+INCOGNITO_MODE: bool = False
 # Considera la call attiva anche quando Teams tiene aperto il microfono (registry CapabilityAccessManager)
 WATCHER_USE_MIC_SIGNAL: bool = True
 TEAMS_MIC_CONSENT_KEYS: tuple[str, ...] = ("MSTeams_8wekyb3d8bbwe",)

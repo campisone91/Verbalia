@@ -22,6 +22,7 @@ class Stage(str, Enum):
     START_DEBOUNCE = "start_debounce"
     RECORDING = "recording"
     RECORDING_AND_TRANSCRIBING = "recording_and_transcribing"
+    PAUSED = "paused"
     GRACE_PERIOD = "grace_period"
     FINALIZING_AUDIO = "finalizing_audio"
     QUEUED = "queued"
@@ -63,6 +64,7 @@ class SessionMode(str, Enum):
     RESUME = "resume"
     TEST_PIPELINE = "test_pipeline"
     DRY_RUN = "dry_run"
+    IMPORTED = "imported"
 
 
 # 9.5 ShutdownReason
@@ -85,6 +87,12 @@ class UiCommandType(str, Enum):
     OPEN_DASHBOARD = "open_dashboard"
     RETRY_JOB = "retry_job"
     CANCEL_JOB = "cancel_job"
+    DELETE_JOB = "delete_job"
+    TOGGLE_INCOGNITO = "toggle_incognito"
+    PAUSE_RECORDING = "pause_recording"
+    RESUME_RECORDING = "resume_recording"
+    TOGGLE_PAUSE = "toggle_pause"
+    IMPORT_AUDIO = "import_audio"
     EXIT = "exit"
 
 
@@ -151,6 +159,14 @@ class AudioChunk:
     status: ChunkStatus
     discontinuities: list[dict[str, object]] = field(default_factory=list)
 
+    @property
+    def offset_sec(self) -> float:
+        return self.start_offset_sec
+
+    @property
+    def chunk_index(self) -> int:
+        return self.index
+
 
 # 9.11 TranscriptSegment
 @dataclass(slots=True)
@@ -160,6 +176,19 @@ class TranscriptSegment:
     end_sec: float
     text: str
     confidence: float | None = None
+    speaker: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.speaker is not None:
+            cleaned_speaker = " ".join(str(self.speaker).strip().split())
+            object.__setattr__(self, "speaker", cleaned_speaker if cleaned_speaker else None)
+
+    @property
+    def display_label(self) -> str:
+        """Etichetta di visualizzazione del parlante (es. 'IO', 'ALTRI' o 'INTERLOCUTORE 1')."""
+        if self.speaker and self.track == TrackLabel.OTHERS:
+            return self.speaker
+        return self.track.value
 
 
 # 9.12 TranscriptionArtifact
@@ -320,6 +349,7 @@ ALLOWED_STAGE_TRANSITIONS: dict[Stage, set[Stage]] = {
     },
     Stage.RECORDING: {
         Stage.RECORDING_AND_TRANSCRIBING,
+        Stage.PAUSED,
         Stage.GRACE_PERIOD,
         Stage.FINALIZING_AUDIO,
         Stage.ERROR,
@@ -327,14 +357,24 @@ ALLOWED_STAGE_TRANSITIONS: dict[Stage, set[Stage]] = {
     },
     Stage.RECORDING_AND_TRANSCRIBING: {
         Stage.RECORDING,
+        Stage.PAUSED,
         Stage.GRACE_PERIOD,
         Stage.FINALIZING_AUDIO,
+        Stage.ERROR,
+        Stage.SHUTTING_DOWN,
+    },
+    Stage.PAUSED: {
+        Stage.RECORDING,
+        Stage.RECORDING_AND_TRANSCRIBING,
+        Stage.FINALIZING_AUDIO,
+        Stage.TRANSCRIBING_FINAL,
         Stage.ERROR,
         Stage.SHUTTING_DOWN,
     },
     Stage.GRACE_PERIOD: {
         Stage.RECORDING,
         Stage.RECORDING_AND_TRANSCRIBING,
+        Stage.PAUSED,
         Stage.FINALIZING_AUDIO,
         Stage.ERROR,
         Stage.SHUTTING_DOWN,

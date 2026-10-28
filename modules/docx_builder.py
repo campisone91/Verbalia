@@ -785,7 +785,12 @@ class MeetingDocxBuilder:
                 continue
             seconds = int(segment.start_sec)
             stamp = f"[{seconds // 3600:02d}:{(seconds % 3600) // 60:02d}:{seconds % 60:02d}]"
-            speaker = io_label if segment.track == TrackLabel.IO else others_label
+            if segment.track == TrackLabel.IO:
+                speaker = io_label
+            elif segment.speaker:
+                speaker = segment.speaker
+            else:
+                speaker = others_label
             text = _sanitize_transcript_text(segment.text)
             if not text:
                 continue

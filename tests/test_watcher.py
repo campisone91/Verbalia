@@ -9,6 +9,8 @@ import pytest
 from modules.contracts import MeetingMetadata, ShutdownReason, Stage
 from modules.watcher import (
     TeamsCallWatcher,
+    WatcherSnapshot,
+    WatcherTransition,
     compute_confidence_score,
     fetch_outlook_meeting_metadata,
     is_teams_audio_active,
@@ -293,3 +295,65 @@ def test_fetch_outlook_meeting_metadata_fallback_and_overlapping_events(
     fallback = fetch_outlook_meeting_metadata(reference_time=fixed_now)
     assert fallback.title == "Riunione Teams"
     assert fallback.source == "fallback"
+
+
+def test_watcher_pause_suspends_grace_period(sample_metadata: MeetingMetadata) -> None:
+    """Verifica che la pausa manuale della registrazione sospenda o annulli il grace period (F5)."""
+    now_val = [100.0]
+    proc_active = [True]
+    audio_active = [True]
+    reporter = _DummyReporter()
+    shutdown_ev = threading.Event()
+
+    watcher = TeamsCallWatcher(
+        stage_reporter=reporter,
+        on_call_started=lambda m, manual: None,
+        on_call_resumed=lambda: None,
+        on_call_suspected_end=lambda rem: None,
+        on_call_ended=lambda reason: None,
+        shutdown_event=shutdown_ev,
+        start_debounce_sec=10.0,
+        stop_grace_period_sec=60.0,
+        process_checker=lambda: proc_active[0],
+        audio_checker=lambda: audio_active[0],
+        window_checker=lambda: True,
+        metadata_fetcher=lambda: sample_metadata,
+        clock=lambda: now_val[0],
+    )
+
+    # 1. Avvia call
+    watcher.step()
+    now_val[0] = 115.0
+    snap = watcher.step()
+    assert snap.state == Stage.RECORDING
+    assert watcher.stage == Stage.RECORDING
+
+    # 2. Audio cade -> entra in GRACE_PERIOD
+    audio_active[0] = False
+    now_val[0] = 120.0
+    snap = watcher.step()
+    assert snap.state == Stage.GRACE_PERIOD
+    assert snap.transition == WatcherTransition.SUSPECTED_END
+    assert watcher.grace_started_at_monotonic == 120.0
+
+    # 3. Pausa attivata durante GRACE_PERIOD -> ripristina RECORDING e azzera grace period
+    watcher.set_recording_paused(True)
+    assert watcher.is_recording_paused is True
+    assert watcher.stage == Stage.RECORDING
+    assert watcher.grace_started_at_monotonic is None
+
+    # 4. Step successivi mentre in pausa non fanno partire il grace period
+    now_val[0] = 200.0
+    snap = watcher.step()
+    assert snap.state == Stage.RECORDING
+    assert snap.transition == WatcherTransition.NONE
+    assert "pausa" in snap.reason.lower()
+    assert watcher.grace_started_at_monotonic is None
+
+    # 5. Ripresa della registrazione: ora senza audio il grace period può ripartire
+    watcher.set_recording_paused(False)
+    assert watcher.is_recording_paused is False
+    snap = watcher.step()
+    assert snap.state == Stage.GRACE_PERIOD
+    assert snap.transition == WatcherTransition.SUSPECTED_END
+

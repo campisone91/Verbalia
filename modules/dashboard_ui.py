@@ -46,6 +46,7 @@ _STAGE_STEP_INDEX: dict[str, int] = {
     Stage.RECORDING.value: 0,
     Stage.RECORDING_AND_TRANSCRIBING.value: 0,
     Stage.GRACE_PERIOD.value: 0,
+    Stage.PAUSED.value: 0,
     Stage.FINALIZING_AUDIO.value: 1,
     Stage.QUEUED.value: 1,
     Stage.TRANSCRIBING_FINAL.value: 2,
@@ -66,11 +67,14 @@ HISTORY_STATUS_FILTERS: tuple[tuple[str, str | None], ...] = (
     ("In coda", "queued"),
     ("In elaborazione", "processing"),
     ("In registrazione", "recording"),
+    ("In pausa", "paused"),
 )
 
 
 def _stage_label(stage: object) -> str:
     if isinstance(stage, str):
+        if stage.lower() == "paused":
+            return "⏸ In Pausa"
         try:
             return STAGE_LABELS_IT.get(Stage(stage), stage)
         except ValueError:
@@ -233,15 +237,35 @@ class DashboardApp:
             ttk.Label(status, textvariable=var, style="Status.TLabel").grid(
                 row=0, column=column, sticky="w", padx=(0, 18)
             )
+        self.incognito_var = tk.BooleanVar(value=bool(self.settings.detection.incognito_mode))
+        self.incognito_btn = ttk.Checkbutton(
+            status,
+            text="Modalità in incognito (Zero Popup)",
+            variable=self.incognito_var,
+            command=self._on_toggle_incognito_quick,
+        )
+        self.incognito_btn.grid(row=0, column=5, sticky="e", padx=(18, 0))
+        status.columnconfigure(5, weight=1)
 
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", pady=(8, 4))
         ttk.Button(buttons, text="Avvia registrazione manuale", command=self._cmd_start_manual).pack(side="left")
         ttk.Button(buttons, text="Termina call ora", command=self._cmd_finalize).pack(side="left", padx=4)
+        self.btn_pause = ttk.Button(buttons, text="⏸ Pausa", command=self._cmd_toggle_pause)
+        self.btn_pause.pack(side="left", padx=4)
+        self.btn_pause.state(["disabled"])
         self.btn_stop = ttk.Button(buttons, text="Arresta elaborazione", command=self._cmd_stop_selected)
         self.btn_stop.pack(side="left", padx=4)
         self.btn_stop.state(["disabled"])
+        self.btn_delete_active_job = ttk.Button(
+            buttons,
+            text="Elimina transazione",
+            command=self._on_delete_active_selected,
+        )
+        self.btn_delete_active_job.pack(side="left", padx=4)
+        self.btn_delete_active_job.state(["disabled"])
         ttk.Button(buttons, text="Riprova", command=self._cmd_retry_selected).pack(side="left", padx=4)
+        ttk.Button(buttons, text="📂 Importa Registrazione", command=self._cmd_import_recording).pack(side="left", padx=4)
         ttk.Button(buttons, text="Copia bozza mail", command=self._cmd_copy_email).pack(side="left", padx=4)
         ttk.Button(buttons, text="Apri DOCX", command=self._open_selected_docx).pack(side="left", padx=4)
         ttk.Button(buttons, text="Apri cartella", command=self._open_selected_folder).pack(side="left", padx=4)
@@ -255,6 +279,20 @@ class DashboardApp:
             self.active_tree.column(col, width=width, anchor="w")
         self.active_tree.pack(fill="x", pady=(4, 6))
         self.active_tree.bind("<<TreeviewSelect>>", lambda _e: self._on_active_select())
+        self.active_tree.bind("<Double-1>", lambda _e: self._open_selected_docx())
+        self.active_tree.bind("<Delete>", lambda _e: self._on_delete_active_selected())
+        self._active_menu = tk.Menu(self.active_tree, tearoff=0)
+        self._active_menu.add_command(label="Apri Word", command=self._open_selected_docx)
+        self._active_menu.add_command(label="Riprova", command=self._cmd_retry_selected)
+        self._active_menu.add_command(label="Pausa / Riprendi", command=self._cmd_toggle_pause)
+        self._active_menu.add_command(label="Arresta", command=self._cmd_stop_selected)
+        self._active_menu.add_command(label="Importa Registrazione", command=self._cmd_import_recording)
+        self._active_menu.add_separator()
+        self._active_menu.add_command(
+            label="Elimina completamente la transazione",
+            command=self._on_delete_active_selected,
+        )
+        self.active_tree.bind("<Button-3>", self._on_active_right_click)
 
         detail = ttk.LabelFrame(frame, text="Dettaglio", padding=6)
         detail.pack(fill="both", expand=True)
@@ -286,6 +324,86 @@ class DashboardApp:
 
     def _cmd_finalize(self) -> None:
         self._send(UiCommandType.FINALIZE_NOW.value)
+
+    def _cmd_toggle_pause(self) -> None:
+        if hasattr(self, "btn_pause"):
+            text = self.btn_pause.cget("text")
+            if "Riprendi" in text:
+                self._send(UiCommandType.RESUME_RECORDING.value)
+            else:
+                self._send(UiCommandType.PAUSE_RECORDING.value)
+        else:
+            self._send(UiCommandType.TOGGLE_PAUSE.value)
+
+    def _cmd_import_recording(self) -> None:
+        from tkinter import filedialog, simpledialog
+        import config as _cfg
+
+        filetypes = [
+            ("File Audio e Video", "*.wav *.mp3 *.m4a *.mp4 *.mkv *.ogg *.flac *.webm *.aac *.wma"),
+            ("File Audio", "*.wav *.mp3 *.m4a *.ogg *.flac *.aac *.wma"),
+            ("File Video", "*.mp4 *.mkv *.webm"),
+            ("Tutti i file", "*.*"),
+        ]
+        filename = filedialog.askopenfilename(
+            title="Seleziona file audio o video da importare",
+            filetypes=filetypes,
+            parent=self.root,
+        )
+        if not filename:
+            return
+        src_path = Path(filename).resolve()
+        ext = src_path.suffix.lower()
+        if ext not in _cfg.SUPPORTED_IMPORT_EXTENSIONS:
+            self._error(
+                "Formato non supportato",
+                f"Il formato '{ext}' non è supportato.\nEstensioni ammesse: {', '.join(_cfg.SUPPORTED_IMPORT_EXTENSIONS)}",
+            )
+            return
+
+        default_title = src_path.stem.replace("_", " ").title()
+        title = simpledialog.askstring(
+            "Titolo Riunione",
+            "Inserisci il titolo della riunione (opzionale):",
+            initialvalue=default_title,
+            parent=self.root,
+        )
+        if title is None:
+            return
+        meeting_title = title.strip() or default_title
+
+        status = self.registry.get_status()
+        heartbeat = parse_iso(status.get("heartbeat"))
+        alive = heartbeat is not None and (now_tz() - heartbeat).total_seconds() < HEARTBEAT_STALE_SEC
+
+        if alive:
+            self._send(
+                UiCommandType.IMPORT_AUDIO.value,
+                {"file_path": str(src_path), "title": meeting_title},
+            )
+            self._info(
+                "Importazione avviata",
+                f"Il file '{src_path.name}' è stato inviato all'applicazione per l'elaborazione.",
+            )
+        else:
+            def _work() -> Path:
+                from modules.orchestrator import MeetingScribeApplication
+
+                app = MeetingScribeApplication(headless=True)
+                return app.run_import_pipeline(src_path, title=meeting_title)
+
+            def _done(result: object) -> None:
+                if isinstance(result, Exception):
+                    self._error("Errore importazione", f"Impossibile completare l'elaborazione: {result}")
+                else:
+                    self._info("Importazione completata", f"Verbale generato con successo:\n{result}")
+                    self._refresh()
+
+            self._info(
+                "Importazione avviata",
+                f"Elaborazione in background di '{src_path.name}' in corso...",
+            )
+            _run_in_background(self.root, _work, _done)
 
     def _cmd_stop_selected(self) -> None:
         session_id = self._selected_active
@@ -386,17 +504,74 @@ class DashboardApp:
         if not _open_path(day_dir if day_dir.is_dir() else self.output_dir):
             self._info("Apri cartella", "Cartella non disponibile.")
 
-    def _on_active_select(self) -> None:
-        selection = self.active_tree.selection()
-        self._selected_active = selection[0] if selection else None
-        job = self._active_jobs.get(self._selected_active or "")
-        status = str(job.get("status") or "") if job else ""
+    def _update_action_buttons(self) -> None:
         if hasattr(self, "btn_stop"):
-            if status in ("processing", "queued", "recording"):
+            curr_job = self._active_jobs.get(self._selected_active or "")
+            status = str(curr_job.get("status") or "") if curr_job else ""
+            if status in ("processing", "queued", "recording", "paused"):
                 self.btn_stop.state(["!disabled"])
             else:
                 self.btn_stop.state(["disabled"])
+
+        if hasattr(self, "btn_delete_active_job"):
+            if self._selected_active:
+                self.btn_delete_active_job.state(["!disabled"])
+            else:
+                self.btn_delete_active_job.state(["disabled"])
+
+        if hasattr(self, "btn_pause"):
+            recording_job = None
+            if self._selected_active and self._selected_active in self._active_jobs:
+                cand = self._active_jobs[self._selected_active]
+                if cand.get("status") in ("recording", "paused") or cand.get("stage") in (
+                    Stage.RECORDING.value,
+                    Stage.RECORDING_AND_TRANSCRIBING.value,
+                    Stage.PAUSED.value,
+                    Stage.GRACE_PERIOD.value,
+                ):
+                    recording_job = cand
+            if recording_job is None:
+                for j in self._active_jobs.values():
+                    if j.get("status") in ("recording", "paused") or j.get("stage") in (
+                        Stage.RECORDING.value,
+                        Stage.RECORDING_AND_TRANSCRIBING.value,
+                        Stage.PAUSED.value,
+                        Stage.GRACE_PERIOD.value,
+                    ):
+                        recording_job = j
+                        break
+
+            if recording_job is not None:
+                self.btn_pause.state(["!disabled"])
+                is_p = (recording_job.get("status") == "paused") or (
+                    str(recording_job.get("stage") or "").lower() == Stage.PAUSED.value
+                )
+                if is_p:
+                    self.btn_pause.config(text="▶ Riprendi")
+                else:
+                    self.btn_pause.config(text="⏸ Pausa")
+            else:
+                self.btn_pause.config(text="⏸ Pausa")
+                self.btn_pause.state(["disabled"])
+
+    def _on_active_select(self) -> None:
+        selection = self.active_tree.selection()
+        self._selected_active = selection[0] if selection else None
+        self._update_action_buttons()
         self._refresh_detail()
+
+    def _on_active_right_click(self, event: Any) -> None:
+        row_id = self.active_tree.identify_row(event.y)
+        if row_id:
+            self.active_tree.selection_set(row_id)
+            self._on_active_select()
+            self._active_menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_delete_active_selected(self) -> None:
+        sid = self._selected_active
+        if not sid:
+            return
+        self._delete_transaction(sid, self._active_jobs.get(sid))
 
     def _refresh(self) -> None:
         try:
@@ -414,6 +589,10 @@ class DashboardApp:
         alive = heartbeat is not None and (now_tz() - heartbeat).total_seconds() < HEARTBEAT_STALE_SEC
         self.var_app.set(f"Applicazione: {'attiva' if alive else 'non in esecuzione'}")
 
+        incognito_state = status.get("incognito_mode")
+        if isinstance(incognito_state, bool) and alive:
+            self.incognito_var.set(incognito_state)
+
         watcher_stage = status.get("watcher_stage") if alive else None
         watcher_text = _stage_label(watcher_stage) if watcher_stage else "-"
         started = status.get("recording_started_at")
@@ -421,6 +600,7 @@ class DashboardApp:
             Stage.RECORDING.value,
             Stage.RECORDING_AND_TRANSCRIBING.value,
             Stage.GRACE_PERIOD.value,
+            Stage.PAUSED.value,
         ):
             watcher_text += f" ({format_duration(_elapsed(started))})"
         detail = status.get("watcher_detail")
@@ -467,15 +647,7 @@ class DashboardApp:
             tree.delete(stale)
         if self._selected_active not in self._active_jobs:
             self._selected_active = None
-            if hasattr(self, "btn_stop"):
-                self.btn_stop.state(["disabled"])
-        elif hasattr(self, "btn_stop"):
-            curr_job = self._active_jobs.get(self._selected_active)
-            status = str(curr_job.get("status") or "") if curr_job else ""
-            if status in ("processing", "queued", "recording"):
-                self.btn_stop.state(["!disabled"])
-            else:
-                self.btn_stop.state(["disabled"])
+        self._update_action_buttons()
 
     def _refresh_detail(self) -> None:
         job = self._active_jobs.get(self._selected_active or "")
@@ -557,7 +729,19 @@ class DashboardApp:
             self.history_tree.heading(col, text=heading)
             self.history_tree.column(col, width=width, anchor="w")
         self.history_tree.pack(fill="both", expand=True, pady=6)
+        self.history_tree.bind("<<TreeviewSelect>>", lambda _e: self._on_history_select())
         self.history_tree.bind("<Double-1>", lambda _e: self._show_timeline())
+        self.history_tree.bind("<Delete>", lambda _e: self._on_history_delete())
+        self._history_menu = tk.Menu(self.history_tree, tearoff=0)
+        self._history_menu.add_command(label="Apri Word", command=self._open_selected_docx)
+        self._history_menu.add_command(label="Apri cartella", command=self._open_selected_folder)
+        self._history_menu.add_command(label="Riprocessa", command=self._reprocess_selected)
+        self._history_menu.add_separator()
+        self._history_menu.add_command(
+            label="Elimina completamente la transazione",
+            command=self._on_history_delete,
+        )
+        self.history_tree.bind("<Button-3>", self._on_history_right_click)
 
         actions = ttk.Frame(frame)
         actions.pack(fill="x")
@@ -567,6 +751,13 @@ class DashboardApp:
             side="left", padx=4
         )
         ttk.Button(actions, text="Riprocessa", command=self._reprocess_selected).pack(side="left", padx=4)
+        self.btn_hist_delete = ttk.Button(
+            actions,
+            text="Elimina transazione",
+            command=self._on_history_delete,
+        )
+        self.btn_hist_delete.pack(side="left", padx=4)
+        self.btn_hist_delete.state(["disabled"])
         ttk.Button(actions, text="Timeline", command=self._show_timeline).pack(side="left", padx=4)
         ttk.Button(actions, text="Esporta CSV", command=self._export_csv).pack(side="left", padx=4)
         ttk.Button(actions, text="Importa storico dal log", command=self._import_log).pack(side="right")
@@ -601,6 +792,8 @@ class DashboardApp:
             return
         tree = self.history_tree
         tree.delete(*tree.get_children())
+        if hasattr(self, "btn_hist_delete"):
+            self.btn_hist_delete.state(["disabled"])
         self._history_rows = {}
         groups: dict[str, list[dict[str, object]]] = {}
         for row in rows:
@@ -641,6 +834,112 @@ class DashboardApp:
         if not selection or selection[0].startswith("day:"):
             return None
         return str(selection[0])
+
+    def _on_history_select(self, _event: object = None) -> None:
+        sid = self._selected_history_id()
+        if hasattr(self, "btn_hist_delete"):
+            if sid is not None:
+                self.btn_hist_delete.state(["!disabled"])
+            else:
+                self.btn_hist_delete.state(["disabled"])
+
+    def _on_history_right_click(self, event: Any) -> None:
+        row_id = self.history_tree.identify_row(event.y)
+        if row_id and not str(row_id).startswith("day:"):
+            self.history_tree.selection_set(row_id)
+            self._on_history_select()
+            self._history_menu.tk_popup(event.x_root, event.y_root)
+
+    def _on_history_delete(self) -> None:
+        sid = self._selected_history_id()
+        if sid is not None:
+            self._delete_transaction(sid, self._history_rows.get(sid))
+
+    def _is_background_alive(self) -> bool:
+        status = self.registry.get_status()
+        heartbeat = parse_iso(status.get("heartbeat"))
+        return heartbeat is not None and (now_tz() - heartbeat).total_seconds() < HEARTBEAT_STALE_SEC
+
+    def _delete_transaction(
+        self,
+        session_id: str,
+        row: dict[str, object] | None = None,
+    ) -> None:
+        info = row or self.registry.get_job(session_id) or {}
+        title = str(info.get("title") or session_id)
+        status = str(info.get("status") or "")
+        docx_path = info.get("docx_path")
+        session_dir = info.get("session_dir")
+
+        details: list[str] = ["• La voce e la cronologia eventi nel registro (Storico e Cruscotto)"]
+        if status in ("recording", "queued", "processing"):
+            details.append("• L'elaborazione o registrazione attualmente in corso verrà interrotta")
+        details.append(f"• I file temporanei di sessione (session_{session_id})")
+        if isinstance(docx_path, str) and docx_path:
+            details.append(f"• Il documento Word generato ({Path(docx_path).name})")
+
+        msg = (
+            f"Vuoi eliminare definitivamente la transazione «{title}» ({session_id})?\n\n"
+            "Verranno rimossi in modo irreversibile:\n"
+            + "\n".join(details)
+        )
+        if not self._confirm("Elimina completamente la transazione", msg):
+            return
+
+        if self._is_background_alive():
+            self._send(
+                UiCommandType.DELETE_JOB.value,
+                {"session_id": session_id},
+            )
+            if status not in ("recording", "queued", "processing"):
+                from modules.orchestrator import purge_session_files
+
+                self.registry.delete_job(session_id)
+                purge_session_files(
+                    session_id=session_id,
+                    session_dir=str(session_dir) if session_dir else None,
+                    docx_path=str(docx_path) if docx_path else None,
+                )
+        else:
+            from modules.orchestrator import purge_session_files
+
+            self.registry.delete_job(session_id)
+            purge_session_files(
+                session_id=session_id,
+                session_dir=str(session_dir) if session_dir else None,
+                docx_path=str(docx_path) if docx_path else None,
+            )
+
+        self._active_jobs.pop(session_id, None)
+        self._history_rows.pop(session_id, None)
+        if self.active_tree.exists(session_id):
+            self.active_tree.delete(session_id)
+        if self.history_tree.exists(session_id):
+            self.history_tree.delete(session_id)
+        self._on_active_select()
+        self._load_history()
+
+    def _on_toggle_incognito_quick(self) -> None:
+        from dataclasses import replace as _dc_replace
+        from modules.settings import apply_to_config, save_settings
+
+        enabled = bool(self.incognito_var.get())
+        updated = _dc_replace(
+            self.settings,
+            detection=_dc_replace(self.settings.detection, incognito_mode=enabled),
+        )
+        save_settings(updated)
+        self.settings = updated
+        apply_to_config(updated)
+        if ("detection", "incognito_mode") in self._setting_vars:
+            var = self._setting_vars[("detection", "incognito_mode")]
+            if hasattr(var, "set"):
+                var.set(enabled)
+        if self._is_background_alive():
+            self._send(
+                UiCommandType.TOGGLE_INCOGNITO.value,
+                {"enabled": enabled},
+            )
 
     def _reprocess_selected(self) -> None:
         session_id = self._selected_history_id()
@@ -837,6 +1136,7 @@ class DashboardApp:
             return
         self.settings = new_settings
         self.output_dir = resolve_output_dir(new_settings)
+        self.incognito_var.set(bool(new_settings.detection.incognito_mode))
         self._send("reload_settings")
         message = "Impostazioni salvate: valgono dalla prossima call o elaborazione."
         if restart:

@@ -242,6 +242,9 @@ class SessionRuntime:
     ended_at: datetime | None = None
     attempts: int = 0
 
+    def transition_to(self, stage: Stage, detail_text: str = "") -> None:
+        self.reporter.set_stage(stage, detail_text)
+
 
 class EventWriter(threading.Thread):
     """Unico consumatore del bus: aggiorna la tray e scrive lo storico SQLite (unico writer)."""
@@ -303,7 +306,10 @@ class EventWriter(threading.Thread):
             return
 
         if event.kind == EVENT_NOTIFY:
-            self._tray.notify(str(event.fields.get("title", "")), event.detail)
+            import config as _cfg
+
+            if not getattr(_cfg, "INCOGNITO_MODE", False):
+                self._tray.notify(str(event.fields.get("title", "")), event.detail)
             return
 
         if event.kind == EVENT_LAST_OUTPUT:
@@ -323,6 +329,12 @@ class EventWriter(threading.Thread):
 
         if event.kind == EVENT_JOB:
             status = event.fields.get("status")
+            if status == "deleted":
+                self._job_status.pop(session_id, None)
+                if self._processing_session == session_id:
+                    self._processing_session = None
+                self._refresh_tray_queue(event)
+                return
             if isinstance(status, str):
                 self._job_status[session_id] = status
                 if status == "processing":

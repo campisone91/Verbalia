@@ -35,6 +35,7 @@ from modules.contracts import (
     TranscriptionError,
     now_tz,
 )
+from modules.diarizer import SessionSpeakerTracker
 from modules.docx_builder import MeetingDocxBuilder, validate_docx_file
 from modules.logging_setup import bind_log_session, get_logger
 from modules.recorder import prevent_system_sleep, restore_system_sleep
@@ -264,6 +265,7 @@ class SessionProcessor:
         self._current_summarizer: SummarizerLike | None = None
         self._gpu_hint_notified = False
         self._cancel_event = threading.Event()
+        self._active_session_id: str | None = None
         self._current_runtime: SessionRuntime | None = None
         self._cancelled_session_ids: set[str] = set()
 
@@ -286,7 +288,7 @@ class SessionProcessor:
     def cancel_current(self) -> None:
         """Annulla la chiamata Ollama in streaming del job in corso (shutdown o cancellazione)."""
         summarizer = self._current_summarizer
-        cancel = getattr(summarizer, "cancel_active_request", None)
+        cancel = getattr(summarizer, "cancel_current", None) or getattr(summarizer, "cancel_active_request", None)
         if callable(cancel):
             cancel()
 
@@ -369,6 +371,7 @@ class SessionProcessor:
                 glossary=resolve_glossary(runtime.settings.output.glossary),
                 session_id=runtime.session_id,
                 priority=WhisperEngine.PRIORITY_PROCESSING,
+                speaker_tracker=SessionSpeakerTracker(session_dir=runtime.session_dir),
             )
             runtime.transcriber = transcriber
         transcriber.start()
@@ -396,11 +399,16 @@ class SessionProcessor:
             )
         return transcriber
 
+    _transcribe_remaining_chunks = prepare_job_from_disk
+
     # ----------------------------------------------------------------- job
     def process(self, runtime: SessionRuntime) -> int:
         """Esegue l'intero job della sessione; solleva ShutdownRequested se interrotto dall'arresto."""
         with bind_log_session(runtime.session_id):
             self._cancel_event.clear()
+            self._active_session_id = runtime.session_id
+            if self._current_summarizer is not None and hasattr(self._current_summarizer, "reset_cancel"):
+                self._current_summarizer.reset_cancel()
             self._current_runtime = runtime
             try:
                 return self._process(runtime)
@@ -416,11 +424,29 @@ class SessionProcessor:
                 self._publish_job(
                     runtime,
                     status="interrupted",
-                    detail="Arrestato dall'utente dal cruscotto",
+                    stage=Stage.ERROR.value,
+                    detail="Annullato dall'utente",
+                    error="Annullato dall'utente",
+                    next_retry_at=None,
                 )
                 runtime.reporter.rebase(Stage.IDLE, "Elaborazione arrestata dall'utente")
                 return EXIT_APP_ERROR
             except Exception as exc:
+                if self._cancel_event.is_set() and not self._shutdown_event.is_set():
+                    logger.info(
+                        "Elaborazione della sessione %s arrestata su richiesta dell'utente (durante step attivo).",
+                        runtime.session_id,
+                    )
+                    self._publish_job(
+                        runtime,
+                        status="interrupted",
+                        stage=Stage.ERROR.value,
+                        detail="Annullato dall'utente",
+                        error="Annullato dall'utente",
+                        next_retry_at=None,
+                    )
+                    runtime.reporter.rebase(Stage.IDLE, "Elaborazione arrestata dall'utente")
+                    return EXIT_APP_ERROR
                 exit_code = int(getattr(exc, "exit_code", EXIT_APP_ERROR))
                 if exit_code == EXIT_CLEANUP_FAILED:
                     self._notify(
@@ -483,6 +509,8 @@ class SessionProcessor:
         self._check_shutdown()
         summarizer = self._summarizer_provider(runtime)
         self._current_summarizer = summarizer
+        if hasattr(summarizer, "reset_cancel"):
+            summarizer.reset_cancel()
         reporter.set_stage(Stage.SUMMARIZING_MAP, "Analisi MAP blocchi conversazione")
         map_paths = summarizer.run_map_phase(
             transcript_path=merged_transcript_path,
@@ -516,6 +544,14 @@ class SessionProcessor:
                     metadata=context.metadata,
                     session_dir=session_dir,
                 )
+        else:
+            email_md_path = session_dir / "reduce" / "recap_email.md"
+            email_md_path.parent.mkdir(parents=True, exist_ok=True)
+            email_md_path.write_text(
+                "Generazione bozza email disattivata nelle impostazioni.\n",
+                encoding="utf-8",
+            )
+            sm.mark_email_reduce_completed(True)
 
         more_pending = self._more_jobs_pending() if self._more_jobs_pending is not None else False
         if OLLAMA_UNLOAD_AFTER_PIPELINE and not more_pending:
@@ -857,8 +893,13 @@ class ProcessingWorker(threading.Thread):
 
 
 def is_recoverable_mode(mode: SessionMode) -> bool:
-    """Le sessioni dry-run non vanno riprese automaticamente."""
-    return mode != SessionMode.DRY_RUN
+    """Le sessioni dry-run e test non vanno riprese automaticamente; AUTO, MANUAL e IMPORTED sì."""
+    return mode in {
+        SessionMode.AUTO,
+        SessionMode.MANUAL,
+        SessionMode.IMPORTED,
+        SessionMode.RESUME,
+    }
 
 
 __all__ = [

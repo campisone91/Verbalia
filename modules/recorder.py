@@ -180,12 +180,28 @@ class _BaseCaptureThread(threading.Thread):
         self.block_ms = max(1, block_ms)
         self._lock = lock if lock is not None else threading.RLock()
         self._suspend_event = threading.Event()
+        self._paused_event = threading.Event()
         self._stream: object | None = None
         self.log_session_id: str | None = None
         # deque.append è thread-safe e non blocca: il callback PortAudio non deve mai attendere lock
         self.status_events: collections.deque[tuple[int, int, int]] = collections.deque(
             maxlen=_STATUS_EVENTS_MAXLEN
         )
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused_event.is_set()
+
+    def pause(self) -> None:
+        self._paused_event.set()
+
+    def resume(self) -> None:
+        self._paused_event.clear()
+
+    def _enqueue_block(self, block: CapturedBlock) -> None:
+        if self._paused_event.is_set():
+            return
+        enqueue_captured_block(self.block_queue, block, self.discontinuities, self._lock)
 
     @property
     def frames_per_buffer(self) -> int:
@@ -228,6 +244,8 @@ class _BaseCaptureThread(threading.Thread):
                 if frame_count > 0
                 else len(payload) // frame_bytes
             )
+            if self._paused_event.is_set():
+                return (None, PA_CONTINUE)
             if actual_frames > 0 and payload:
                 block = CapturedBlock(
                     track=track,
@@ -238,7 +256,7 @@ class _BaseCaptureThread(threading.Thread):
                     sample_width=sample_width,
                     payload=payload,
                 )
-                enqueue_captured_block(target_queue, block, disc_list, lock)
+                self._enqueue_block(block)
             return (None, PA_CONTINUE)
 
         return _callback
@@ -383,6 +401,7 @@ class _TrackBufferState:
         self.wav_path: Path | None = None
         self.written_frames: int = 0
         self.overlap_frames_written: int = 0
+        self.last_frame_monotonic: float | None = None
         self._ring_chunks: collections.deque[tuple[int, bytes]] = collections.deque()
         self._ring_frames: int = 0
 
@@ -420,6 +439,7 @@ class _TrackBufferState:
             return
         self.wav_handle.writeframes(payload)
         self.written_frames += frame_count
+        self.last_frame_monotonic = time.monotonic()
         self._update_ring_buffer(payload, frame_count)
 
     def _update_ring_buffer(self, payload: bytes, frame_count: int) -> None:
@@ -501,10 +521,54 @@ class ChunkAssembler:
 
         self._current_chunk_index: int = 0
         self._chunk_started_monotonic: float = self._clock()
+        self._session_started_monotonic: float = self._chunk_started_monotonic
         self._current_start_offset_sec: float = 0.0
         self._timeline_Cumulative_sec: float = 0.0
         self._chunk_discontinuities: list[dict[str, object]] = []
         self._is_open: bool = False
+        self._is_paused: bool = False
+        self._pause_started_mono: float | None = None
+        self._total_paused_sec: float = 0.0
+
+    @property
+    def is_paused(self) -> bool:
+        with self._lock:
+            return self._is_paused
+
+    @property
+    def total_paused_sec(self) -> float:
+        with self._lock:
+            return self._total_paused_sec
+
+    def pause(self, now_mono: float | None = None) -> bool:
+        """Attiva la pausa della sessione dopo aver allineato le tracce."""
+        with self._lock:
+            if self._is_paused:
+                return False
+            ref_mono = time.monotonic() if now_mono is None else float(now_mono)
+            elapsed = max(0.0, ref_mono - self._chunk_started_monotonic)
+            self.compensate_idle_tracks(elapsed)
+            self._is_paused = True
+            self._pause_started_mono = ref_mono
+            return True
+
+    def resume(self, now_mono: float | None = None) -> float:
+        """Riprende la sessione e compensa il clock dei chunk con la durata della pausa."""
+        with self._lock:
+            if not self._is_paused:
+                return 0.0
+            current = time.monotonic() if now_mono is None else float(now_mono)
+            pause_start = self._pause_started_mono if self._pause_started_mono is not None else current
+            paused_delta = max(0.0, current - pause_start)
+            self._total_paused_sec += paused_delta
+            self._chunk_started_monotonic += paused_delta
+            self._session_started_monotonic += paused_delta
+            for state in (self._io_state, self._others_state):
+                if state.last_frame_monotonic is not None:
+                    state.last_frame_monotonic += paused_delta
+            self._is_paused = False
+            self._pause_started_mono = None
+            return paused_delta
 
     @property
     def current_chunk_index(self) -> int:
@@ -574,7 +638,7 @@ class ChunkAssembler:
     ) -> int:
         """Scrive un CapturedBlock nella traccia corrispondente, iniettando silenzio se necessario."""
         with self._lock:
-            if not self._is_open:
+            if not self._is_open or self._is_paused:
                 return 0
             state = self._get_track_state(block.track)
             elapsed = (
@@ -605,13 +669,20 @@ class ChunkAssembler:
             state.append_frames(block.payload, block.frame_count)
             return injected
 
+    def append_block(
+        self,
+        block: CapturedBlock,
+        elapsed_chunk_sec: float | None = None,
+    ) -> int:
+        return self.write_block(block, elapsed_chunk_sec)
+
     def compensate_idle_tracks(
         self,
         elapsed_chunk_sec: float | None = None,
     ) -> dict[TrackLabel, int]:
         """Compensa i periodi di silenzio digitale su entrambe le tracce e corregge il drift (Sezione 20.5)."""
         with self._lock:
-            if not self._is_open:
+            if not self._is_open or self._is_paused:
                 return {TrackLabel.IO: 0, TrackLabel.OTHERS: 0}
 
             elapsed = (
@@ -732,7 +803,7 @@ class ChunkAssembler:
     def should_rotate(self, now_monotonic: float | None = None) -> bool:
         """Restituisce True se il chunk corrente ha raggiunto o superato chunk_duration_sec."""
         with self._lock:
-            if not self._is_open:
+            if not self._is_open or self._is_paused:
                 return False
             ref_mono = float(now_monotonic) if now_monotonic is not None else float(self._clock())
             return (ref_mono - self._chunk_started_monotonic) >= float(
@@ -1096,9 +1167,11 @@ class DualTrackRecorder:
         self._reconnect_max_attempts = max(1, int(reconnect_max_attempts))
 
         self._lock = threading.RLock()
+        self._pause_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._finalize_event = threading.Event()
         self._is_recording: bool = False
+        self._is_paused: bool = False
         self._sleep_prevented: bool = False
         self._session_started_monotonic: float = 0.0
 
@@ -1131,6 +1204,41 @@ class DualTrackRecorder:
     def finalize_event(self) -> threading.Event:
         """Evento impostato al raggiungimento della durata massima o richiesta di chiusura."""
         return self._finalize_event
+
+    @property
+    def is_paused(self) -> bool:
+        with self._pause_lock:
+            return self._is_paused
+
+    def pause(self) -> bool:
+        """Mette in pausa la cattura audio e l'assemblaggio dei chunk."""
+        with self._pause_lock:
+            if not self._is_recording or self._is_paused:
+                return False
+            self._is_paused = True
+            if self._mic_thread is not None:
+                self._mic_thread.pause()
+            if self._loopback_thread is not None:
+                self._loopback_thread.pause()
+            if self._assembler is not None:
+                self._assembler.pause()
+            logger.info("Registrazione sessione %s messa in pausa.", self.session_id)
+            return True
+
+    def resume(self) -> bool:
+        """Riprende la cattura audio e compensa i clock dei chunk."""
+        with self._pause_lock:
+            if not self._is_recording or not self._is_paused:
+                return False
+            if self._assembler is not None:
+                self._assembler.resume()
+            if self._mic_thread is not None:
+                self._mic_thread.resume()
+            if self._loopback_thread is not None:
+                self._loopback_thread.resume()
+            self._is_paused = False
+            logger.info("Registrazione sessione %s ripresa.", self.session_id)
+            return True
 
     def start(self) -> None:
         """Avvia l'acquisizione audio dual-track, il ChunkAssembler e il worker FFmpeg."""
@@ -1493,6 +1601,8 @@ class DualTrackRecorder:
         attenderla con wait_normalized().
         """
         try:
+            if self.is_paused:
+                self.resume()
             self._stop_event.set()
             self._finalize_event.set()
 

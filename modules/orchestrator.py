@@ -59,6 +59,7 @@ from modules.audio_utils import (
     discover_audio_devices,
     is_valid_normalized_wav,
     normalize_wav_with_ffmpeg,
+    prepare_imported_audio_session,
     split_wav_file,
 )
 from modules.contracts import (
@@ -87,6 +88,7 @@ from modules.docx_builder import (
     migrate_flat_output_to_daily,
     validate_docx_file,
 )
+from modules.hotkey import GlobalHotkeyListener
 from modules.job_registry import JobRegistry
 from modules.logging_setup import (
     configure_logging,
@@ -119,12 +121,13 @@ from modules.session_runtime import (
 )
 from modules.settings import (
     AppSettings,
+    apply_to_config,
     load_settings,
     resolve_output_dir,
     resolve_settings_path,
     to_summarizer_options,
 )
-from modules.state_manager import get_state_manager, is_session_locked
+from modules.state_manager import get_state_manager, is_session_locked, release_state_manager
 from modules.summarizer import OllamaMapReduceSummarizer
 from modules.transcriber import RollingTranscriber, WhisperEngine
 from modules.transcript_utils import (
@@ -221,6 +224,63 @@ def _default_consent_prompt(notice_text: str) -> bool:
     return True
 
 
+def purge_session_files(
+    session_id: str,
+    session_dir: Path | str | None = None,
+    docx_path: Path | str | None = None,
+    temp_root: Path | None = None,
+) -> tuple[bool, bool]:
+    """Rimuove da disco la cartella temporanea della sessione e il file Word generato.
+
+    Restituisce `(temp_deleted, docx_deleted)`.
+    """
+    import shutil as _shutil
+
+    temp_deleted = False
+    docx_deleted = False
+
+    candidates: list[Path] = []
+    if session_dir:
+        candidates.append(Path(session_dir))
+    base_temp = temp_root if temp_root is not None else TEMP_DIR
+    default_dir = base_temp / f"session_{session_id}"
+    if default_dir not in candidates:
+        candidates.append(default_dir)
+
+    for cand in candidates:
+        try:
+            release_state_manager(cand)
+        except Exception:
+            pass
+        lock_file = cand / ".owner.lock"
+        if lock_file.exists():
+            try:
+                lock_file.unlink()
+            except OSError:
+                pass
+        if cand.exists():
+            try:
+                _shutil.rmtree(cand, ignore_errors=False)
+                temp_deleted = True
+            except OSError:
+                _shutil.rmtree(cand, ignore_errors=True)
+                temp_deleted = not cand.exists()
+
+    if docx_path:
+        docx_file = Path(docx_path)
+        if docx_file.is_file():
+            try:
+                docx_file.unlink()
+                docx_deleted = True
+                parent = docx_file.parent
+                if parent.is_dir() and parent.name[:4].isdigit() and not any(parent.iterdir()):
+                    parent.rmdir()
+            except OSError as exc:
+                get_logger("orchestrator").warning("Impossibile eliminare il file DOCX %s: %s", docx_file, exc)
+
+    return temp_deleted, docx_deleted
+
+
 def verify_or_request_user_consent(
     consent_path: Path = USER_CONSENT_PATH,
     *,
@@ -228,6 +288,10 @@ def verify_or_request_user_consent(
     prompt_callback: Callable[[str], bool] | None = None,
 ) -> bool:
     """Verifica o richiede il consenso privacy iniziale prima della prima registrazione (Sezione 42)."""
+    import config as _cfg
+
+    if bool(getattr(_cfg, "INCOGNITO_MODE", False)):
+        return True
     if not require_confirmation:
         return True
     if has_valid_user_consent(consent_path):
@@ -274,8 +338,54 @@ class RecordingController:
         self._grace_meeting: MeetingMetadata | None = None
         self._grace_thread: threading.Thread | None = None
 
+    @property
+    def recorder(self) -> Any:
+        return self._app.live.recorder if self._app.live is not None else None
+
+    @property
+    def runtime(self) -> SessionRuntime | None:
+        return self._app.live
+
+    @property
+    def transcriber(self) -> Any:
+        return self._app.live.transcriber if self._app.live is not None else None
+
+    @property
+    def is_paused(self) -> bool:
+        rec = self.recorder
+        if rec is None:
+            return False
+        return bool(getattr(rec, "is_paused", False))
+
+    def pause(self) -> bool:
+        if self.recorder is None or self.is_paused:
+            return False
+        if not self.recorder.pause():
+            return False
+        if self.runtime is not None:
+            self.runtime.transition_to(Stage.PAUSED, "Registrazione in pausa dall'utente")
+        return True
+
+    def resume(self) -> bool:
+        if self.recorder is None or not self.is_paused:
+            return False
+        if not self.recorder.resume():
+            return False
+        if self.runtime is not None:
+            is_busy = False
+            if self.transcriber is not None:
+                is_busy = bool(getattr(self.transcriber, "is_busy", False)) or (getattr(self.transcriber, "pending", 0) > 0)
+            target_stage = Stage.RECORDING_AND_TRANSCRIBING if is_busy else Stage.RECORDING
+            self.runtime.transition_to(target_stage, "Registrazione ripresa")
+        return True
+
+    def toggle_pause(self) -> bool:
+        return self.resume() if self.is_paused else self.pause()
+
     def on_call_started(self, metadata: MeetingMetadata, is_manual: bool) -> None:
         app = self._app
+        if app.watcher is not None:
+            app.watcher.set_recording_paused(False)
         if app.live is not None:
             self._logger.warning("Richiesta di avvio ignorata: una registrazione è già attiva.")
             return
@@ -341,6 +451,8 @@ class RecordingController:
         app = self._app
         with self._grace_lock:
             self._grace_meeting = None
+        if app.watcher is not None:
+            app.watcher.set_recording_paused(False)
         app.finalize_live_session(reason)
         watcher = app.watcher
         # Nello split B6 il watcher è già in RECORDING per la nuova call: non va riportato in IDLE
@@ -369,6 +481,15 @@ class MeetingScribeApplication:
         self.logger = get_logger("orchestrator")
 
         self.settings: AppSettings = settings if settings is not None else load_settings()
+        if os.environ.get("VERBALIA_INCOGNITO", "").strip() in ("1", "true", "True"):
+            from dataclasses import replace as _dc_replace
+
+            self.settings = _dc_replace(
+                self.settings,
+                detection=_dc_replace(self.settings.detection, incognito_mode=True),
+            )
+        apply_to_config(self.settings)
+        self._explicit_output_dir: bool = output_dir is not None
         self.output_dir: Path = (
             output_dir if output_dir is not None else resolve_output_dir(self.settings)
         ).resolve()
@@ -397,6 +518,7 @@ class MeetingScribeApplication:
             headless=self.headless,
             on_open_dashboard=self.launch_dashboard,
         )
+        self.tray.set_incognito_mode(bool(self.settings.detection.incognito_mode))
         self.arbiter = AiResourceArbiter(self.settings.execution.parallel_policy)
         self.engine = WhisperEngine(
             whisper_lock=self.arbiter.whisper_lock,
@@ -479,9 +601,34 @@ class MeetingScribeApplication:
         )
 
     def reload_settings(self) -> AppSettings:
-        """Rilegge settings.json: i nuovi valori valgono dalla prossima sessione o dal prossimo job."""
-        self.settings = load_settings()
+        """Ricarica settings.json e applica a caldo i parametri non strutturali."""
+        new_settings = load_settings()
+        apply_to_config(new_settings)
+        self.settings = new_settings
+        if not getattr(self, "_explicit_output_dir", False):
+            self.output_dir = resolve_output_dir(new_settings)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            self.tray.set_output_dir(self.output_dir)
+        self.tray.set_incognito_mode(bool(new_settings.detection.incognito_mode))
+        self.apply_watcher_settings()
+        self._publish_app_status()
+        self.logger.info("Impostazioni ricaricate a caldo da settings.json.")
         return self.settings
+
+    def toggle_incognito_mode(self, enabled: bool | None = None) -> bool:
+        """Attiva o disattiva la modalità in incognito e salva l'impostazione su disco."""
+        from dataclasses import replace as _dc_replace
+        from modules.settings import save_settings
+
+        target = (not self.settings.detection.incognito_mode) if enabled is None else bool(enabled)
+        updated = _dc_replace(
+            self.settings,
+            detection=_dc_replace(self.settings.detection, incognito_mode=target),
+        )
+        save_settings(updated)
+        self.reload_settings()
+        self.logger.info("Modalità in incognito impostata a: %s", target)
+        return target
 
     def apply_watcher_settings(self) -> None:
         if self.watcher is None:
@@ -555,6 +702,11 @@ class MeetingScribeApplication:
 
     def _ensure_consent_before_recording(self) -> bool:
         """Verifica il consenso privacy prima di iniziare la registrazione."""
+        import config as _cfg
+
+        if bool(self.settings.detection.incognito_mode) or bool(getattr(_cfg, "INCOGNITO_MODE", False)):
+            self.logger.info("Modalità in incognito attiva: popup consenso prima registrazione soppresso.")
+            return True
         prompt_cb = self._consent_prompt_callback
         if prompt_cb is None and self.headless:
             def _headless_accept(_notice: str) -> bool:
@@ -796,46 +948,186 @@ class MeetingScribeApplication:
         self.processing_queue.put(ProcessingJob(session_id=session_id, session_dir=session_dir))
         return True
 
-    def cancel_job(self, session_id: str) -> bool:
-        """Arresta un'elaborazione in corso o la rimuove dalla coda (comando dal cruscotto)."""
-        if self.worker is not None and self.worker.cancel_session(session_id):
-            self.logger.info("Elaborazione della sessione %s arrestata.", session_id)
-            self._notify("Elaborazione Arrestata", f"Sessione {session_id} interrotta su richiesta.")
-            return True
+    def _abort_live_session_if_matches(self, session_id: str) -> SessionRuntime | None:
+        """Ferma e rilascia tutte le risorse della sessione live se corrisponde a `session_id`."""
+        live = self.live
+        if live is None or live.session_id != session_id:
+            return None
+        self.live = None
 
+        if self.watcher is not None:
+            self.watcher.suppress_current_call()
+        if live.recorder is not None:
+            try:
+                live.recorder.stop_capture()
+            except Exception as exc:
+                self.logger.debug("Errore stop_capture durante abort live %s: %s", session_id, exc)
+        if live.transcriber is not None:
+            try:
+                live.transcriber.cancel()
+            except Exception as exc:
+                self.logger.debug("Errore transcriber.cancel durante abort live %s: %s", session_id, exc)
+        if hasattr(self.engine, "cancel_session"):
+            try:
+                self.engine.cancel_session(session_id)
+            except Exception:
+                pass
+        try:
+            live.state_manager.release_owner_lock()
+        except Exception:
+            pass
+        try:
+            release_state_manager(live.session_dir)
+        except Exception:
+            pass
+        self.tray.set_recording_status(Stage.IDLE, "Registrazione annullata dall'utente")
+        return live
+
+    def cancel_job(self, session_id: str) -> bool:
+        """Annulla un job in coda, in elaborazione o in registrazione live."""
         if self.processing_queue.remove(session_id):
             self._publish_job(
                 session_id,
                 status="interrupted",
-                detail="Elaborazione rimossa dalla coda dal cruscotto",
+                stage=Stage.ERROR.value,
+                detail="Annullato in coda dall'utente",
+                error="Annullato dall'utente",
+                next_retry_at=None,
             )
-            self._notify("Elaborazione Rimossa", f"Sessione {session_id} rimossa dalla coda.")
+            self._notify("Job Annullato", f"Sessione {session_id} rimossa dalla coda.")
             return True
-
-        live = self.live
-        if live is not None and live.session_id == session_id:
-            self.logger.info("Registrazione live della sessione %s arrestata dall'utente.", session_id)
-            if self.watcher is not None:
-                self.watcher.request_finalize()
-            if live.recorder is not None:
-                live.recorder.stop_capture()
+        if self.worker is not None and self.worker.cancel_session(session_id):
+            if hasattr(self.engine, "cancel_session"):
+                try:
+                    self.engine.cancel_session(session_id)
+                except Exception:
+                    pass
+            self._notify("Annullamento in corso", f"Interruzione di {session_id}...")
+            return True
+        live = self._abort_live_session_if_matches(session_id)
+        if live is not None:
             self._publish_job(
                 session_id,
                 status="interrupted",
-                detail="Registrazione interrotta dall'utente",
+                stage=Stage.ERROR.value,
+                detail="Registrazione annullata dall'utente",
+                error="Annullato dall'utente",
+                call_ended_at=now_tz().isoformat(),
             )
-            self.live = None
-            self.tray.set_recording_status(Stage.IDLE, "Registrazione annullata dall'utente")
-            self._notify("Registrazione Annullata", "La registrazione in corso è stata interrotta.")
+            self._notify("Registrazione Annullata", f"Sessione {session_id} interrotta.")
             return True
 
         return False
+
+    def delete_job(self, session_id: str) -> None:
+        """Elimina completamente una transazione (live, in coda, in elaborazione o storica)."""
+        if not session_id:
+            return
+        live = self._abort_live_session_if_matches(session_id)
+        self.processing_queue.remove(session_id)
+        if self.worker is not None and self.worker.cancel_session(session_id):
+            if hasattr(self.engine, "cancel_session"):
+                try:
+                    self.engine.cancel_session(session_id)
+                except Exception:
+                    pass
+            deadline = time.monotonic() + 3.0
+            while (
+                self.worker.current_session_id == session_id
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.05)
+
+        record = self.registry.delete_job(session_id) if self.registry is not None else None
+        session_dir = (
+            live.session_dir
+            if live is not None
+            else (record.get("session_dir") if record is not None else None)
+        )
+        docx_path = record.get("docx_path") if record is not None else None
+
+        self._publish_job(session_id, status="deleted")
+        if docx_path:
+            self.tray.clear_last_output_file_if_matches(Path(str(docx_path)))
+
+        temp_deleted, docx_deleted = purge_session_files(
+            session_id=session_id,
+            session_dir=str(session_dir) if session_dir else None,
+            docx_path=str(docx_path) if docx_path else None,
+            temp_root=self.temp_dir,
+        )
+        self.logger.info(
+            "Transazione %s eliminata completamente (temp_deleted=%s, docx_deleted=%s).",
+            session_id,
+            temp_deleted,
+            docx_deleted,
+        )
+
+    def enqueue_imported_audio(
+        self,
+        file_path: Path | str,
+        title: str | None = None,
+    ) -> SessionContext | None:
+        """Prepara e accoda un file audio/video esterno nella processing_queue (Feature F1)."""
+        src = Path(file_path).resolve()
+        if not src.exists() or not src.is_file():
+            self.logger.error("File audio importato non trovato: %s", src)
+            self._notify("Errore importazione", f"File non trovato: {src.name}")
+            return None
+
+        ffmpeg_bin = resolve_ffmpeg_executable() or FFMPEG_LOCAL_PATH
+        try:
+            ctx = prepare_imported_audio_session(
+                source_path=src,
+                title=title,
+                temp_root=self.temp_dir,
+                ffmpeg_path=ffmpeg_bin,
+            )
+        except Exception as exc:
+            self.logger.error("Errore durante la preparazione del file importato %s: %s", src, exc, exc_info=True)
+            self._notify("Errore importazione", f"Impossibile preparare {src.name}: {exc}")
+            return None
+
+        self._publish_job(
+            ctx.session_id,
+            title=ctx.metadata.title,
+            mode=ctx.mode.value,
+            status="queued",
+            stage=Stage.QUEUED.value,
+            call_started_at=ctx.started_at,
+            session_dir=str(ctx.session_dir),
+            attempts=0,
+        )
+        if self.registry is not None:
+            self.registry.upsert_job(
+                ctx.session_id,
+                title=ctx.metadata.title,
+                mode=ctx.mode.value,
+                status="queued",
+                stage=Stage.QUEUED.value,
+                session_dir=str(ctx.session_dir),
+                call_started_at=ctx.started_at.isoformat(),
+            )
+            self.registry.append_event(
+                ctx.session_id,
+                "IMPORTED",
+                f"File importato: {src.name}",
+            )
+
+        job = ProcessingJob(session_id=ctx.session_id, session_dir=ctx.session_dir)
+        self.processing_queue.put(job)
+        self.logger.info("Sessione da file importato accodata: %s (id=%s)", src.name, ctx.session_id)
+        self._notify("Audio importato", f"Sessione '{ctx.metadata.title}' aggiunta alla coda di elaborazione.")
+        return ctx
 
     def _recover_pending_sessions(self) -> int:
         """Accoda in ordine cronologico le sessioni rimaste su disco e non in uso da altri."""
         recovered = 0
         for session_dir in discover_recoverable_sessions(self.temp_dir):
             session_id = session_dir.name.removeprefix("session_")
+            if self.registry is not None and self.registry.is_deleted(session_id):
+                purge_session_files(session_id, session_dir=session_dir, temp_root=self.temp_dir)
+                continue
             if self.processing_queue.contains(session_id) or is_session_locked(session_dir):
                 continue
             job_info = self.registry.get_job(session_id) if self.registry is not None else None
@@ -878,13 +1170,18 @@ class MeetingScribeApplication:
 
     # ------------------------------------------------------------- comandi UI
     def _drain_ui_commands_in_auto(self) -> None:
-        """Consuma i comandi inviati dalla System Tray durante il loop automatico."""
+        """Consuma i comandi inviati dalla System Tray o dalla scorciatoia globale durante il loop automatico."""
         while True:
             try:
                 cmd = self.ui_queue.get_nowait()
             except queue.Empty:
                 break
-            self._handle_command(cmd.value, {})
+            if isinstance(cmd, tuple) and len(cmd) == 2:
+                cmd_name = getattr(cmd[0], "value", str(cmd[0]))
+                payload = cmd[1] if isinstance(cmd[1], dict) else {}
+                self._handle_command(cmd_name, payload)
+            else:
+                self._handle_command(getattr(cmd, "value", str(cmd)), {})
 
     def _poll_registry_commands(self) -> None:
         """Comandi inviati dal cruscotto (altro processo) tramite la tabella ui_commands."""
@@ -906,6 +1203,52 @@ class MeetingScribeApplication:
             if self.watcher is not None:
                 self.watcher.request_finalize()
             self.finalize_event.set()
+        elif command in (
+            UiCommandType.PAUSE_RECORDING.value,
+            UiCommandType.RESUME_RECORDING.value,
+            UiCommandType.TOGGLE_PAUSE.value,
+        ):
+            if self.live is not None:
+                if command == UiCommandType.PAUSE_RECORDING.value:
+                    ok = self.controller.pause()
+                elif command == UiCommandType.RESUME_RECORDING.value:
+                    ok = self.controller.resume()
+                else:
+                    ok = self.controller.toggle_pause()
+                is_paused = self.controller.is_paused
+                if self.watcher is not None:
+                    self.watcher.set_recording_paused(is_paused)
+                if ok:
+                    target_stage = Stage.PAUSED if is_paused else (
+                        Stage.RECORDING_AND_TRANSCRIBING
+                        if (getattr(self.live.transcriber, "is_busy", False) or getattr(self.live.transcriber, "pending", 0) > 0)
+                        else Stage.RECORDING
+                    )
+                    stage_label = "Registrazione in Pausa" if is_paused else "Registrazione in corso"
+                    self.tray.set_recording_status(target_stage, stage_label)
+                    if self.registry is not None:
+                        self.registry.upsert_job(
+                            self.live.session_id,
+                            stage=target_stage.value,
+                            status="paused" if is_paused else "recording",
+                        )
+                        self.registry.append_event(
+                            self.live.session_id,
+                            "PAUSED" if is_paused else "RESUMED",
+                            stage_label,
+                        )
+                    self._publish_app_status()
+        elif command == UiCommandType.IMPORT_AUDIO.value:
+            file_path_raw = payload.get("file_path") or payload.get("path")
+            title_raw = payload.get("title")
+            if isinstance(file_path_raw, (str, Path)) and file_path_raw:
+                t = threading.Thread(
+                    target=self.enqueue_imported_audio,
+                    args=(Path(file_path_raw), str(title_raw) if title_raw else None),
+                    name=f"ImportAudio-{Path(file_path_raw).name}",
+                    daemon=True,
+                )
+                t.start()
         elif command == UiCommandType.RETRY_JOB.value:
             session_id = payload.get("session_id")
             if isinstance(session_id, str) and session_id:
@@ -914,6 +1257,15 @@ class MeetingScribeApplication:
             session_id = payload.get("session_id")
             if isinstance(session_id, str) and session_id:
                 self.cancel_job(session_id)
+        elif command == UiCommandType.DELETE_JOB.value:
+            session_id = payload.get("session_id")
+            if isinstance(session_id, str) and session_id:
+                self.delete_job(session_id)
+        elif command == UiCommandType.TOGGLE_INCOGNITO.value:
+            enabled_val = payload.get("enabled")
+            self.toggle_incognito_mode(
+                bool(enabled_val) if isinstance(enabled_val, bool) else None
+            )
         elif command == "reload_settings":
             self.reload_settings()
             if self.live is None:
@@ -937,6 +1289,8 @@ class MeetingScribeApplication:
                     "llm_gpu_percent": self.arbiter.last_gpu_percent,
                     "ai_parallel": self.arbiter.parallel,
                     "ai_policy": self.arbiter.policy,
+                    "auto_record": self.settings.detection.auto_record_teams_calls,
+                    "incognito_mode": self.settings.detection.incognito_mode,
                     "whisper_model": self.engine.model_name,
                     "llm_model": self.settings.ollama.model,
                 },
@@ -963,6 +1317,17 @@ class MeetingScribeApplication:
         self._recover_pending_sessions()
         self.worker = self._make_worker()
         self.worker.start()
+
+        hotkey_listener: GlobalHotkeyListener | None = None
+        import config as _cfg
+        hotkey_enabled = getattr(_cfg, "PAUSE_HOTKEY_ENABLED_DEFAULT", True)
+        hotkey_str = getattr(_cfg, "PAUSE_HOTKEY_DEFAULT", "Ctrl+Alt+P")
+        if hotkey_enabled:
+            try:
+                hotkey_listener = GlobalHotkeyListener(hotkey_str=hotkey_str, command_queue=self.ui_queue)
+                hotkey_listener.start()
+            except Exception as exc:
+                self.logger.warning("Avvio GlobalHotkeyListener fallito: %s", exc)
 
         detection = self.settings.detection
         self.watcher = TeamsCallWatcher(
@@ -1003,12 +1368,21 @@ class MeetingScribeApplication:
                     self.watcher.request_finalize()
                     next_watch = 0.0
                 if now_mono >= next_status:
+                    if self.controller.is_paused:
+                        if self.watcher is not None:
+                            self.watcher.set_recording_paused(True)
+                        self.tray.set_recording_status(Stage.PAUSED, "Registrazione in Pausa")
                     self._publish_app_status()
                     next_status = now_mono + _STATUS_PUBLISH_INTERVAL_SEC
                 self.shutdown_event.wait(timeout=0.1)
         except KeyboardInterrupt:
             self.request_shutdown(ShutdownReason.USER_REQUEST)
         finally:
+            if hotkey_listener is not None:
+                try:
+                    hotkey_listener.stop()
+                except Exception as exc:
+                    self.logger.debug("Arresto GlobalHotkeyListener: %s", exc)
             self._perform_coordinated_shutdown()
 
         return EXIT_SUCCESS
@@ -1176,6 +1550,84 @@ class MeetingScribeApplication:
             else:
                 self.logger.error("Errore in --test-pipeline: %s", exc, exc_info=True)
             return EXIT_APP_ERROR
+        finally:
+            set_log_session_id(None)
+            self._perform_coordinated_shutdown()
+
+    def run_import_pipeline(
+        self,
+        audio_file: Path | str,
+        title: str | None = None,
+    ) -> Path:
+        """Esegue la pipeline completa su un file audio/video esterno e restituisce il percorso del Word generato (F1)."""
+        self._start_services()
+        try:
+            src = Path(audio_file).resolve()
+            if not src.exists() or not src.is_file():
+                self.logger.error("File audio non trovato per run_import_pipeline: %s", src)
+                raise FileNotFoundError(f"File non trovato: {src}")
+
+            ffmpeg_bin = resolve_ffmpeg_executable() or FFMPEG_LOCAL_PATH
+            ctx = prepare_imported_audio_session(
+                source_path=src,
+                title=title,
+                temp_root=self.temp_dir,
+                ffmpeg_path=ffmpeg_bin,
+            )
+            set_log_session_id(ctx.session_id)
+            self._publish_job(
+                ctx.session_id,
+                title=ctx.metadata.title,
+                mode=ctx.mode.value,
+                status="queued",
+                stage=Stage.QUEUED.value,
+                call_started_at=ctx.started_at,
+                session_dir=str(ctx.session_dir),
+                attempts=0,
+            )
+            if self.registry is not None:
+                self.registry.upsert_job(
+                    ctx.session_id,
+                    title=ctx.metadata.title,
+                    mode=ctx.mode.value,
+                    status="queued",
+                    stage=Stage.QUEUED.value,
+                    session_dir=str(ctx.session_dir),
+                    call_started_at=ctx.started_at.isoformat(),
+                )
+                self.registry.append_event(
+                    ctx.session_id,
+                    "IMPORTED",
+                    f"File importato: {src.name}",
+                )
+
+            worker = self._make_worker()
+            exit_code = worker.run_job(
+                ProcessingJob(session_id=ctx.session_id, session_dir=ctx.session_dir),
+                retry=False,
+            )
+            if exit_code != EXIT_SUCCESS:
+                raise RuntimeError(f"Elaborazione fallita per il file {src.name} (codice={exit_code})")
+
+            docx_path: Path | None = None
+            if self.tray.last_output_file is not None and self.tray.last_output_file.is_file():
+                docx_path = self.tray.last_output_file
+            elif self.registry is not None:
+                job_info = self.registry.get_job(ctx.session_id)
+                if job_info and job_info.get("docx_path"):
+                    cand = Path(str(job_info["docx_path"]))
+                    if cand.is_file():
+                        docx_path = cand
+
+            if docx_path is None:
+                candidates = sorted(self.output_dir.rglob("*.docx"), key=lambda p: p.stat().st_mtime, reverse=True)
+                if candidates:
+                    docx_path = candidates[0]
+
+            if docx_path is None:
+                raise RuntimeError(f"Elaborazione completata ma nessun file Word trovato in {self.output_dir}")
+
+            return docx_path
         finally:
             set_log_session_id(None)
             self._perform_coordinated_shutdown()

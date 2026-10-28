@@ -36,6 +36,7 @@ from modules.contracts import (
     TranscriptSegment,
     atomic_write_text,
 )
+from modules.diarizer import SessionSpeakerTracker
 from modules.logging_setup import get_logger, set_thread_log_session_id
 from modules.transcript_utils import (
     apply_custom_glossary_normalization,
@@ -371,6 +372,7 @@ class RollingTranscriber:
         session_id: str | None = None,
         engine: WhisperEngine | None = None,
         priority: int = WhisperEngine.PRIORITY_LIVE,
+        speaker_tracker: SessionSpeakerTracker | None = None,
     ) -> None:
         self._session_dir: Path = session_dir.resolve()
         self._state_manager: StateManager | None = state_manager
@@ -384,6 +386,11 @@ class RollingTranscriber:
         self._holder = _WhisperModelHolder(model_factory=model_factory)
         self._glossary: str = resolve_glossary(glossary)
         self._session_id: str | None = session_id
+        self._speaker_tracker: SessionSpeakerTracker | None = (
+            speaker_tracker
+            if speaker_tracker is not None
+            else SessionSpeakerTracker(session_dir=self._session_dir)
+        )
         self._beam_size: int = engine.beam_size if engine is not None else WHISPER_BEAM_SIZE
         self._language: str = engine.language if engine is not None else WHISPER_LANGUAGE
         self.priority: int = int(priority)
@@ -404,6 +411,11 @@ class RollingTranscriber:
         self._finished: bool = False
         self._worker_error: Exception | None = None
         self._artifacts: list[TranscriptionArtifact] = []
+
+    @property
+    def speaker_tracker(self) -> SessionSpeakerTracker | None:
+        """Restituisce il SessionSpeakerTracker associato alla sessione."""
+        return self._speaker_tracker
 
     @property
     def artifacts(self) -> list[TranscriptionArtifact]:
@@ -428,6 +440,11 @@ class RollingTranscriber:
         """Chunk accodati e non ancora trascritti."""
         with self._pending_cond:
             return self._pending
+
+    @property
+    def is_busy(self) -> bool:
+        """True se ci sono chunk accodati o in fase di trascrizione."""
+        return self.pending > 0
 
     @property
     def finished(self) -> bool:
@@ -747,7 +764,11 @@ class RollingTranscriber:
                     )
         return not wav_path.exists()
 
-    def transcribe_chunk_sync(self, chunk: AudioChunk) -> TranscriptionArtifact:
+    def transcribe_chunk_sync(
+        self,
+        chunk: AudioChunk,
+        speaker_tracker: SessionSpeakerTracker | None = None,
+    ) -> TranscriptionArtifact:
         """Trascrive in modo sincrono entrambe le tracce del chunk, valida l'output ed elimina i WAV."""
         started_monotonic = time.monotonic()
         with self._ai_lock:  # type: ignore[attr-defined]
@@ -779,6 +800,22 @@ class RollingTranscriber:
                     TrackLabel.OTHERS,
                     chunk.start_offset_sec,
                 )
+
+                tracker = speaker_tracker if speaker_tracker is not None else self._speaker_tracker
+                if tracker is not None and getattr(tracker, "enabled", False):
+                    try:
+                        chunk_offset = getattr(chunk, "offset_sec", chunk.start_offset_sec)
+                        others_segments = tracker.assign_speakers_to_segments(
+                            wav_path=chunk.others_wav_path,
+                            segments=others_segments,
+                            chunk_offset_sec=chunk_offset,
+                        )
+                    except Exception as diar_exc:
+                        logger.warning(
+                            "Diarizzazione chunk #%03d non riuscita (fallback [ALTRI]): %s",
+                            chunk.index,
+                            diar_exc,
+                        )
 
                 combined_segments = io_segments + others_segments
                 combined_segments.sort(
@@ -853,3 +890,6 @@ class RollingTranscriber:
                 self._handle_worker_error(exc)
             finally:
                 self._queue.task_done()
+
+    _process_chunk = transcribe_chunk_sync
+

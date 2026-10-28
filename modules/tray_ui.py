@@ -40,6 +40,10 @@ STAGE_COLORS: dict[Stage, dict[str, str]] = {
         "border": "#B71C1C",
         "ring": "#00ACC1",
     },
+    Stage.PAUSED: {
+        "fill": "#F59E0B",
+        "border": "#D97706",
+    },
     Stage.GRACE_PERIOD: {
         "fill": "#FFB300",
         "border": "#FF8F00",
@@ -105,6 +109,7 @@ STAGE_LABELS_IT: dict[Stage, str] = {
     Stage.START_DEBOUNCE: "Verifica avvio call Teams",
     Stage.RECORDING: "Registrazione in corso",
     Stage.RECORDING_AND_TRANSCRIBING: "Registrazione + Trascrizione",
+    Stage.PAUSED: "Registrazione in Pausa",
     Stage.GRACE_PERIOD: "Pausa temporanea (Grace Period)",
     Stage.FINALIZING_AUDIO: "Finalizzazione tracce audio",
     Stage.QUEUED: "In coda di elaborazione",
@@ -129,12 +134,13 @@ RECORDING_CHANNEL_STAGES: frozenset[Stage] = frozenset(
         Stage.START_DEBOUNCE,
         Stage.RECORDING,
         Stage.RECORDING_AND_TRANSCRIBING,
+        Stage.PAUSED,
         Stage.GRACE_PERIOD,
         Stage.FINALIZING_AUDIO,
     }
 )
 ACTIVE_RECORDING_STAGES: frozenset[Stage] = frozenset(
-    {Stage.RECORDING, Stage.RECORDING_AND_TRANSCRIBING, Stage.GRACE_PERIOD}
+    {Stage.RECORDING, Stage.RECORDING_AND_TRANSCRIBING, Stage.PAUSED, Stage.GRACE_PERIOD}
 )
 
 
@@ -290,6 +296,7 @@ class StageMonitorTray:
         *,
         output_dir: Path | None = None,
         log_path: Path | None = None,
+        log_dir: Path | None = None,
         headless: bool = False,
         on_open_dashboard: Callable[[str | None], None] | None = None,
     ) -> None:
@@ -310,6 +317,9 @@ class StageMonitorTray:
         self._occurred_at = now_tz()
         self._last_output_file: Path | None = None
         self._on_open_dashboard = on_open_dashboard
+        import config as _cfg
+
+        self._incognito_mode: bool = bool(getattr(_cfg, "INCOGNITO_MODE", False))
 
         # Stato composito: canale registrazione (watcher) e canale elaborazione (job in coda)
         self._recording_stage: Stage = Stage.IDLE
@@ -324,9 +334,12 @@ class StageMonitorTray:
         self._output_dir: Path = (
             output_dir if output_dir is not None else OUTPUT_DIR
         ).resolve()
-        self._log_path: Path = (
-            log_path if log_path is not None else (LOG_DIR / "app.log")
-        ).resolve()
+        if log_path is not None:
+            self._log_path = log_path.resolve()
+        elif log_dir is not None:
+            self._log_path = (log_dir / "app.log").resolve()
+        else:
+            self._log_path = (LOG_DIR / "app.log").resolve()
         self._headless: bool = bool(
             headless
             or os.environ.get("TEAMS_SCRIBE_HEADLESS_TRAY") == "1"
@@ -387,6 +400,7 @@ class StageMonitorTray:
             self.format_status_label(),
             "Avvia Registrazione Manuale Ora",
             "Termina Call e Genera Recap Ora",
+            "Pausa / Riprendi Registrazione (Ctrl+Alt+P)",
             "Apri Cruscotto",
             "Impostazioni",
             "Apri Ultimo File Word",
@@ -447,8 +461,17 @@ class StageMonitorTray:
     def _on_finalize_now(self, *_args: object) -> None:
         self._enqueue_command(UiCommandType.FINALIZE_NOW)
 
+    def _on_toggle_pause(self, *_args: object) -> None:
+        self._enqueue_command(UiCommandType.TOGGLE_PAUSE)
+
     def _on_open_dashboard_item(self, *_args: object) -> None:
         self._open_dashboard(None)
+
+    def _on_toggle_incognito(self, *_args: object) -> None:
+        self._enqueue_command(UiCommandType.TOGGLE_INCOGNITO)
+
+    def _dispatch_command(self, command: UiCommandType) -> None:
+        self._enqueue_command(command)
 
     def _on_open_settings_item(self, *_args: object) -> None:
         self._open_dashboard("impostazioni")
@@ -498,6 +521,15 @@ class StageMonitorTray:
         with self._lock:
             return self._recording_stage in ACTIVE_RECORDING_STAGES
 
+    def _can_toggle_pause(self) -> bool:
+        with self._lock:
+            active_stage = (
+                self._recording_stage
+                if self._recording_stage in ACTIVE_RECORDING_STAGES
+                else self._stage
+            )
+            return not self._shutting_down and active_stage in ACTIVE_RECORDING_STAGES
+
     def _has_last_docx(self) -> bool:
         with self._lock:
             return (
@@ -526,9 +558,19 @@ class StageMonitorTray:
                 enabled=lambda _item: self._can_finalize_now(),
             ),
             pystray.MenuItem(
+                "Pausa / Riprendi Registrazione (Ctrl+Alt+P)",
+                self._on_toggle_pause,
+                enabled=lambda _item: self._can_toggle_pause(),
+            ),
+            pystray.MenuItem(
                 "Apri Cruscotto",
                 self._on_open_dashboard_item,
                 default=True,
+            ),
+            pystray.MenuItem(
+                "Modalità in incognito (Zero Popup)",
+                self._on_toggle_incognito,
+                checked=lambda _item: self._incognito_mode,
             ),
             pystray.MenuItem(
                 "Impostazioni",
@@ -738,17 +780,63 @@ class StageMonitorTray:
                     sanitize_for_log(str(exc)),
                 )
 
+    def clear_last_output_file_if_matches(self, docx_path: Path | None) -> None:
+        with self._lock:
+            if docx_path is not None and self._last_output_file is not None:
+                try:
+                    if self._last_output_file.resolve() == Path(docx_path).resolve():
+                        self._last_output_file = None
+                except OSError:
+                    if self._last_output_file == Path(docx_path):
+                        self._last_output_file = None
+            elif docx_path is None:
+                self._last_output_file = None
+            icon = self._icon
+        if icon is not None and hasattr(icon, "update_menu"):
+            try:
+                icon.update_menu()
+            except Exception:
+                pass
+
+    def set_output_dir(self, output_dir: Path) -> None:
+        with self._lock:
+            self._output_dir = Path(output_dir)
+
+    def set_incognito_mode(self, enabled: bool) -> None:
+        with self._lock:
+            self._incognito_mode = bool(enabled)
+            icon = self._icon
+        if icon is not None and hasattr(icon, "update_menu"):
+            try:
+                icon.update_menu()
+            except Exception as exc:
+                self._logger.debug("Aggiornamento menu incognito ignorato: %s", exc)
+
+    def is_incognito_mode(self) -> bool:
+        with self._lock:
+            return self._incognito_mode
+
     def notify(self, title: str, message: str) -> None:
         """Mostra una notifica desktop tramite la System Tray se supportata."""
+        import config as _cfg
+
+        with self._lock:
+            incognito = self._incognito_mode or bool(getattr(_cfg, "INCOGNITO_MODE", False))
+            icon = self._icon
+        if incognito:
+            self._logger.debug("Notifica soppressa (modalità in incognito) [%s]: %s", title, message)
+            return
+
         clean_title = title.strip() or APP_NAME
         clean_message = message.strip()
         if not clean_message:
             return
 
-        with self._lock:
-            icon = self._icon
+        if icon is None:
+            self._logger.info("Notifica tray [%s]: %s", title, message)
+            return
 
-        if icon is not None and hasattr(icon, "notify"):
+        if hasattr(icon, "notify"):
             try:
                 icon.notify(clean_message[:250], clean_title[:60])
             except Exception as exc:  # pragma: no cover

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import wave
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 from config import (
@@ -352,6 +354,7 @@ def build_ffmpeg_normalize_command(
         str(input_wav),
         "-af",
         "loudnorm=I=-16:LRA=11:TP=-1.5,aresample=16000:async=1:first_pts=0",
+        "-vn",
         "-ac",
         str(TARGET_CHANNELS),
         "-ar",
@@ -436,13 +439,26 @@ def is_valid_normalized_wav(wav_path: Path) -> bool:
         return False
 
 
+def _resolve_default_ffmpeg_path() -> Path:
+    import config as _cfg
+
+    local_path = getattr(_cfg, "FFMPEG_LOCAL_PATH", None)
+    if local_path is not None and isinstance(local_path, Path) and local_path.exists():
+        return local_path
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return Path(system_ffmpeg)
+    return local_path if local_path is not None else Path("bin/ffmpeg.exe")
+
+
 def normalize_wav_with_ffmpeg(
-    ffmpeg_path: Path,
-    raw_wav: Path,
-    normalized_wav: Path,
+    ffmpeg_path: Path | None = None,
+    raw_wav: Path | None = None,
+    normalized_wav: Path | None = None,
     *,
     delete_raw_on_success: bool = True,
     timeout_sec: int = 300,
+    **kwargs: object,
 ) -> Path:
     """Normalizza un file WAV grezzo a 16 kHz mono tramite FFmpeg (Sezioni 3.2 e 20.7).
 
@@ -450,11 +466,28 @@ def normalize_wav_with_ffmpeg(
     scritto, promosso atomicamente, riaperto e validato con `wave`.
     In caso di errore FFmpeg o validazione fallita, il file raw viene preservato.
     """
-    if not raw_wav.exists() or not raw_wav.is_file():
-        raise AudioProcessingError(f"File WAV grezzo non trovato: {raw_wav}")
+    if normalized_wav is None and raw_wav is not None:
+        actual_raw = ffmpeg_path
+        actual_norm = raw_wav
+        kw_ff = kwargs.get("ffmpeg_path")
+        actual_ffmpeg = kw_ff if kw_ff is not None else _resolve_default_ffmpeg_path()
+    else:
+        kw_ff = kwargs.get("ffmpeg_path")
+        actual_ffmpeg = ffmpeg_path if ffmpeg_path is not None else (kw_ff or _resolve_default_ffmpeg_path())
+        actual_raw = raw_wav
+        actual_norm = normalized_wav
 
-    normalized_wav.parent.mkdir(parents=True, exist_ok=True)
-    temp_output = normalized_wav.with_suffix(".tmp.wav")
+    if actual_raw is None or not Path(actual_raw).exists() or not Path(actual_raw).is_file():
+        raise AudioProcessingError(f"File WAV grezzo non trovato: {actual_raw}")
+    if actual_norm is None:
+        raise AudioProcessingError("Percorso di destinazione normalizzato non specificato.")
+
+    raw_wav_p = Path(actual_raw)
+    normalized_wav_p = Path(actual_norm)
+    ffmpeg_exe = Path(actual_ffmpeg)  # type: ignore[arg-type]
+
+    normalized_wav_p.parent.mkdir(parents=True, exist_ok=True)
+    temp_output = normalized_wav_p.with_suffix(".tmp.wav")
 
     if temp_output.exists():
         try:
@@ -463,8 +496,8 @@ def normalize_wav_with_ffmpeg(
             logger.debug("Impossibile rimuovere file temporaneo preesistente %s: %s", temp_output, exc)
 
     command = build_ffmpeg_normalize_command(
-        ffmpeg_path=ffmpeg_path,
-        input_wav=raw_wav,
+        ffmpeg_path=ffmpeg_exe,
+        input_wav=raw_wav_p,
         output_wav=temp_output,
     )
 
@@ -486,7 +519,7 @@ def normalize_wav_with_ffmpeg(
             except OSError as unlink_exc:
                 logger.debug("Errore pulizia temp WAV dopo timeout: %s", unlink_exc)
         raise AudioProcessingError(
-            f"Timeout FFmpeg ({timeout_sec}s) durante la normalizzazione di {raw_wav}"
+            f"Timeout FFmpeg ({timeout_sec}s) durante la normalizzazione di {raw_wav_p}"
         ) from exc
     except OSError as exc:
         if temp_output.exists():
@@ -495,7 +528,7 @@ def normalize_wav_with_ffmpeg(
             except OSError as unlink_exc:
                 logger.debug("Errore pulizia temp WAV dopo OSError: %s", unlink_exc)
         raise AudioProcessingError(
-            f"Impossibile eseguire FFmpeg ({ffmpeg_path}): {exc}"
+            f"Impossibile eseguire FFmpeg ({ffmpeg_exe}): {exc}"
         ) from exc
 
     if completed.returncode != 0:
@@ -506,13 +539,13 @@ def normalize_wav_with_ffmpeg(
                 logger.debug("Errore pulizia temp WAV dopo fallimento FFmpeg: %s", unlink_exc)
         stderr_msg = (completed.stderr or "").strip()
         raise AudioProcessingError(
-            f"FFmpeg terminato con codice {completed.returncode} su {raw_wav}: {stderr_msg}"
+            f"FFmpeg terminato con codice {completed.returncode} su {raw_wav_p}: {stderr_msg}"
         )
 
     try:
         validate_normalized_wav(temp_output)
-        replace_with_retry(temp_output, normalized_wav)
-        validate_normalized_wav(normalized_wav)
+        replace_with_retry(temp_output, normalized_wav_p)
+        validate_normalized_wav(normalized_wav_p)
     except Exception as exc:
         if temp_output.exists():
             try:
@@ -522,20 +555,20 @@ def normalize_wav_with_ffmpeg(
         if isinstance(exc, AudioProcessingError):
             raise
         raise AudioProcessingError(
-            f"Errore durante la promozione/validazione di {normalized_wav}: {exc}"
+            f"Errore durante la promozione/validazione di {normalized_wav_p}: {exc}"
         ) from exc
 
-    if delete_raw_on_success and raw_wav.resolve() != normalized_wav.resolve():
+    if delete_raw_on_success and raw_wav_p.resolve() != normalized_wav_p.resolve():
         try:
-            raw_wav.unlink()
+            raw_wav_p.unlink()
         except OSError as exc:
             logger.warning(
                 "WAV normalizzato valido ma impossibile eliminare il raw %s: %s",
-                raw_wav,
+                raw_wav_p,
                 exc,
             )
 
-    return normalized_wav
+    return normalized_wav_p
 
 
 def create_silent_wav(
@@ -619,6 +652,7 @@ def split_wav_file(
     output_dir: Path,
     chunk_duration_sec: int = CHUNK_DURATION_SEC,
     overlap_sec: int = CHUNK_OVERLAP_SEC,
+    prefix: str | None = None,
 ) -> list[tuple[Path, float, float]]:
     """Suddivide un file WAV in chunk con overlap per la modalità --test-pipeline (Sezione 30).
 
@@ -662,7 +696,10 @@ def split_wav_file(
                 src.setpos(start_frame)
                 raw_data = src.readframes(frames_to_read)
 
-                chunk_path = output_dir / f"chunk_{chunk_index:03d}_altri_raw.wav"
+                if prefix is not None:
+                    chunk_path = output_dir / f"{prefix}_{chunk_index:03d}.wav"
+                else:
+                    chunk_path = output_dir / f"chunk_{chunk_index:03d}_altri_raw.wav"
                 temp_chunk = chunk_path.with_suffix(".tmp.wav")
                 with wave.open(str(temp_chunk), "wb") as dst:
                     dst.setnchannels(channels)
@@ -689,3 +726,148 @@ def split_wav_file(
         raise AudioProcessingError(
             f"Errore durante la suddivisione del file WAV {input_wav}: {exc}"
         ) from exc
+
+
+@dataclass(frozen=True, slots=True)
+class WavFileInfo:
+    duration_sec: float
+    sample_rate: int
+    channels: int
+    sample_width: int
+    frames: int
+
+
+def inspect_wav_file(wav_path: Path) -> WavFileInfo:
+    """Ispeziona i metadati di un file WAV e restituisce un WavFileInfo."""
+    path = Path(wav_path).resolve()
+    if not path.exists() or not path.is_file():
+        raise AudioProcessingError(f"File WAV non trovato: {path}")
+    try:
+        with wave.open(str(path), "rb") as wf:
+            rate = wf.getframerate()
+            frames = wf.getnframes()
+            channels = wf.getnchannels()
+            width = wf.getsampwidth()
+            dur = frames / float(rate) if rate > 0 else 0.0
+            return WavFileInfo(
+                duration_sec=dur,
+                sample_rate=rate,
+                channels=channels,
+                sample_width=width,
+                frames=frames,
+            )
+    except (wave.Error, EOFError, OSError) as exc:
+        raise AudioProcessingError(f"Impossibile leggere file WAV {path}: {exc}") from exc
+
+
+def prepare_imported_audio_session(
+    source_path: Path | None = None,
+    title: str | None = None,
+    temp_root: Path | None = None,
+    ffmpeg_path: Path | None = None,
+    chunk_duration_sec: int | None = None,
+    overlap_sec: int | None = None,
+    *,
+    input_audio_path: Path | None = None,
+    temp_dir: Path | None = None,
+) -> SessionContext:
+    """Importa e prepara una sessione da un file audio o video esterno (Feature F1)."""
+    import config as _cfg
+    from modules.contracts import (
+        MeetingMetadata,
+        SessionContext,
+        SessionMode,
+        Stage,
+        generate_session_id,
+        now_tz,
+    )
+    from modules.state_manager import (
+        acquire_session_owner_lock,
+        release_session_owner_lock,
+        save_session_state,
+    )
+
+    raw_src = source_path if source_path is not None else input_audio_path
+    if raw_src is None:
+        raise AudioProcessingError("Nessun percorso sorgente specificato.")
+    src = Path(raw_src).resolve()
+    if not src.exists() or not src.is_file():
+        raise AudioProcessingError(f"File sorgente non trovato o non valido: {src}")
+    if src.stat().st_size == 0:
+        raise AudioProcessingError(f"Il file sorgente è vuoto: {src}")
+    if src.suffix.lower() not in _cfg.SUPPORTED_IMPORT_EXTENSIONS:
+        raise AudioProcessingError(
+            f"Formato file '{src.suffix}' non supportato per l'importazione. "
+            f"Estensioni supportate: {', '.join(_cfg.SUPPORTED_IMPORT_EXTENSIONS)}"
+        )
+
+    session_id = generate_session_id()
+    effective_temp = (temp_root or temp_dir or _cfg.TEMP_DIR).resolve()
+    session_dir = (effective_temp / f"{_cfg.SESSION_DIR_PREFIX}{session_id}").resolve()
+    audio_work_dir = session_dir / _cfg.AUDIO_WORK_SUBDIR
+    transcripts_dir = session_dir / _cfg.TRANSCRIPTS_SUBDIR
+    audio_work_dir.mkdir(parents=True, exist_ok=True)
+    transcripts_dir.mkdir(parents=True, exist_ok=True)
+
+    owner_lock = acquire_session_owner_lock(session_dir)
+    try:
+        resolved_ffmpeg = ffmpeg_path or _resolve_default_ffmpeg_path()
+        full_norm_wav = audio_work_dir / "imported_full_16k.wav"
+        normalize_wav_with_ffmpeg(
+            resolved_ffmpeg,
+            src,
+            full_norm_wav,
+            delete_raw_on_success=False,
+        )
+
+        c_dur = chunk_duration_sec if chunk_duration_sec is not None else _cfg.CHUNK_DURATION_SEC
+        o_sec = overlap_sec if overlap_sec is not None else _cfg.CHUNK_OVERLAP_SEC
+        split_chunks = split_wav_file(
+            input_wav=full_norm_wav,
+            output_dir=audio_work_dir,
+            chunk_duration_sec=c_dur,
+            overlap_sec=o_sec,
+            prefix="imported_part",
+        )
+
+        recorded_chunks: list[int] = []
+        normalized_chunks: list[int] = []
+
+        for idx, (part_path, _s, _e) in enumerate(split_chunks):
+            others_norm = audio_work_dir / f"chunk_{idx:03d}_altri_16k.wav"
+            part_path.replace(others_norm)
+            part_info = inspect_wav_file(others_norm)
+            io_norm = audio_work_dir / f"chunk_{idx:03d}_io_16k.wav"
+            create_silent_wav(
+                io_norm,
+                duration_sec=part_info.duration_sec,
+                sample_rate=_cfg.WHISPER_SAMPLE_RATE,
+                channels=_cfg.WHISPER_CHANNELS,
+                sample_width=_cfg.SAMPLE_WIDTH_BYTES,
+            )
+            recorded_chunks.append(idx)
+            normalized_chunks.append(idx)
+
+        full_norm_wav.unlink(missing_ok=True)
+
+        meeting_title = (title or src.stem).strip() or src.stem
+        context = SessionContext(
+            schema_version=_cfg.STATE_SCHEMA_VERSION,
+            session_id=session_id,
+            session_dir=session_dir,
+            mode=SessionMode.IMPORTED,
+            metadata=MeetingMetadata(
+                title=meeting_title,
+                scheduled_start=now_tz(),
+                scheduled_end=None,
+                source="imported_file",
+            ),
+            started_at=now_tz(),
+            stage=Stage.TRANSCRIBING_FINAL,
+            recorded_chunks=recorded_chunks,
+            normalized_chunks=normalized_chunks,
+        )
+        save_session_state(context)
+        return context
+    finally:
+        release_session_owner_lock(session_dir)

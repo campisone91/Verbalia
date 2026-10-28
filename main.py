@@ -90,6 +90,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Esegue l'intera pipeline su una copia del file audio specificato.",
     )
     mode_group.add_argument(
+        "--import-file",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help="Importa ed elabora un file audio/video esterno (.mp3, .wav, .m4a, .mp4, .mkv, ecc.).",
+    )
+    mode_group.add_argument(
         "--dry-run",
         action="store_true",
         help="Esegue un test sintetico completo senza hardware audio né modelli AI.",
@@ -105,15 +112,27 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Apre il cruscotto (stato, storico e impostazioni) in una finestra separata.",
     )
     parser.add_argument(
+        "--title",
+        type=str,
+        default=None,
+        metavar="TITLE",
+        help="Titolo opzionale della riunione per --import-file.",
+    )
+    parser.add_argument(
         "--tab",
         choices=("cruscotto", "storico", "impostazioni"),
         default=None,
         help="Scheda iniziale del cruscotto (solo con --dashboard).",
     )
+    parser.add_argument(
+        "--incognito",
+        action="store_true",
+        help="Avvia Verbalia in modalità in incognito (nessun popup o notifica toast in nessuna fase).",
+    )
     return parser
 
 
-def _acquire_app_instance() -> SingleInstance | None:
+def _acquire_app_instance(incognito_active: bool = False) -> SingleInstance | None:
     """Una sola istanza registrante per volta: due watcher registrerebbero la stessa call."""
     instance = SingleInstance(APP_MUTEX_NAME)
     if instance.acquire():
@@ -123,7 +142,7 @@ def _acquire_app_instance() -> SingleInstance | None:
         "Usare il menu della tray o il cruscotto per controllarlo."
     )
     sys.stderr.write(message + "\n")
-    if os.environ.get("TEAMS_SCRIBE_HEADLESS_TRAY") != "1":
+    if not incognito_active and os.environ.get("TEAMS_SCRIBE_HEADLESS_TRAY") != "1":
         show_message_box(APP_NAME, message)
     return None
 
@@ -136,6 +155,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SystemExit as exc:
         code = exc.code if isinstance(exc.code, int) else EXIT_INVALID_ARGS
         return code
+
+    from modules.settings import apply_settings
+
+    settings = apply_settings()
+    incognito_active = (
+        bool(getattr(args, "incognito", False))
+        or os.environ.get("VERBALIA_INCOGNITO", "").strip() in ("1", "true", "True")
+        or bool(settings.detection.incognito_mode)
+    )
+    if incognito_active:
+        os.environ["VERBALIA_INCOGNITO"] = "1"
+        import config as _cfg
+
+        _cfg.INCOGNITO_MODE = True
 
     if args.setup_only:
         try:
@@ -178,6 +211,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         app = MeetingScribeApplication()
         return app.run_test_pipeline(audio_path)
 
+    if args.import_file is not None:
+        raw_import = str(args.import_file).strip()
+        if not raw_import:
+            sys.stderr.write("Errore: specificare un file valido per --import-file.\n")
+            return EXIT_INVALID_ARGS
+        import_path = Path(raw_import).resolve()
+        if not import_path.exists():
+            sys.stderr.write(f"Errore: il file specificato non esiste: {import_path}\n")
+            return EXIT_INVALID_ARGS
+        if import_path.is_dir():
+            sys.stderr.write(
+                f"Errore: il percorso indicato per --import-file è una directory: {import_path}\n"
+            )
+            return EXIT_INVALID_ARGS
+        try:
+            app = MeetingScribeApplication(headless=True)
+            docx_path = app.run_import_pipeline(import_path, title=args.title)
+            print(f"File importato ed elaborato con successo: {docx_path}")
+            return EXIT_SUCCESS
+        except Exception as exc:
+            sys.stderr.write(f"Errore durante l'importazione di {import_path}: {exc}\n")
+            return EXIT_APP_ERROR
+
     if args.dry_run:
         app = MeetingScribeApplication(headless=True)
         return app.run_dry_run()
@@ -191,9 +247,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         return run_dashboard(initial_tab=args.tab)
 
-    instance = _acquire_app_instance()
+    instance = _acquire_app_instance(incognito_active=incognito_active)
     if instance is None:
-        return EXIT_APP_ERROR
+        return 0
 
     if args.record_now:
         try:

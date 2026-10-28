@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "verbalia"
-version = "0.1.0"
+version = "1.0.0"
 description = "Applicazione desktop locale Windows per registrazione dual-track, trascrizione faster-whisper e verbalizzazione Ollama di call Microsoft Teams."
 readme = "README.md"
 requires-python = ">=3.10"

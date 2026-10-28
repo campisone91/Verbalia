@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import ctypes
+import dataclasses
+from enum import Enum
 import math
 import re
 import threading
@@ -76,6 +78,25 @@ logger = get_logger("watcher")
 
 _ACTIVE_AUDIO_SESSION_STATE: int = 1
 _PEAK_ACTIVITY_EPSILON: float = 1e-4
+
+
+class WatcherTransition(str, Enum):
+    """Transizioni di stato notificate dal watcher (Sezione 19 / F5)."""
+
+    NONE = "none"
+    CALL_STARTED = "call_started"
+    CALL_RESUMED = "call_resumed"
+    SUSPECTED_END = "suspected_end"
+    CALL_ENDED = "call_ended"
+
+
+@dataclasses.dataclass(frozen=True)
+class WatcherSnapshot:
+    """Istantanea immutabile dello stato corrente del watcher."""
+
+    state: Stage
+    transition: WatcherTransition = WatcherTransition.NONE
+    reason: str = ""
 
 
 def compute_confidence_score(
@@ -715,8 +736,13 @@ class TeamsCallWatcher:
 
         self._lock = threading.RLock()
         self._stage: Stage = Stage.IDLE
+        self._manual_recording: bool = False
+        self._finalize_requested: bool = False
         self._manual_start_requested: bool = False
         self._manual_finalize_requested: bool = False
+        self._suppress_until_call_ends: bool = False
+        self._auto_detect_enabled: bool = True
+        self._recording_paused: bool = False
 
         self.candidate_started_at_monotonic: float | None = None
         self.last_active_at_monotonic: float | None = None
@@ -729,6 +755,38 @@ class TeamsCallWatcher:
         """Restituisce lo stage interno corrente del watcher."""
         with self._lock:
             return self._stage
+
+    @property
+    def is_recording_paused(self) -> bool:
+        """Indica se la registrazione è attualmente in pausa manuale (F5)."""
+        with self._lock:
+            return self._recording_paused
+
+    @property
+    def _state(self) -> Stage:
+        """Alias retrocompatibile per lo stage interno del watcher."""
+        with self._lock:
+            return self._stage
+
+    @property
+    def _grace_started_at(self) -> float | None:
+        """Alias retrocompatibile per l'istante di avvio del grace period."""
+        with self._lock:
+            return self.grace_started_at_monotonic
+
+    def set_recording_paused(self, paused: bool) -> None:
+        """Imposta o rimuove lo stato di pausa della registrazione nel watcher (F5)."""
+        with self._lock:
+            self._recording_paused = bool(paused)
+            if self._recording_paused:
+                if self._stage == Stage.GRACE_PERIOD:
+                    self._stage = Stage.RECORDING
+                    self._stage_reporter.set_stage(
+                        Stage.RECORDING, "Registrazione in pausa: grace period sospeso"
+                    )
+                self.grace_started_at_monotonic = None
+            else:
+                self.grace_started_at_monotonic = None
 
     @property
     def is_call_active(self) -> bool:
@@ -746,6 +804,7 @@ class TeamsCallWatcher:
         start_debounce_sec: float | None = None,
         stop_grace_period_sec: float | None = None,
         use_mic_signal: bool | None = None,
+        auto_record_teams_calls: bool | None = None,
     ) -> None:
         """Aggiorna i parametri di rilevamento; valgono dalla prossima call."""
         with self._lock:
@@ -755,6 +814,27 @@ class TeamsCallWatcher:
                 self._stop_grace_period_sec = max(0.0, float(stop_grace_period_sec))
             if use_mic_signal is not None:
                 self._use_mic_signal = bool(use_mic_signal)
+            if auto_record_teams_calls is not None:
+                self._auto_detect_enabled = bool(auto_record_teams_calls)
+
+    def configure(
+        self,
+        *,
+        auto_detect_enabled: bool | None = None,
+        start_debounce_sec: float | None = None,
+        stop_grace_sec: float | None = None,
+        confidence_threshold: float | None = None,
+        use_mic_signal: bool | None = None,
+        signal_weights: Mapping[str, float] | None = None,
+    ) -> None:
+        """Configura a caldo i parametri del watcher."""
+        del confidence_threshold, signal_weights
+        self.apply_settings(
+            start_debounce_sec=start_debounce_sec,
+            stop_grace_period_sec=stop_grace_sec,
+            use_mic_signal=use_mic_signal,
+            auto_record_teams_calls=auto_detect_enabled,
+        )
 
     def seconds_since_last_active(self) -> float:
         """Secondi trascorsi dall'ultimo istante in cui la call risultava attiva (0 se ignoto)."""
@@ -763,22 +843,45 @@ class TeamsCallWatcher:
                 return 0.0
             return max(0.0, float(self._clock()) - self.last_active_at_monotonic)
 
+    def suppress_current_call(self) -> None:
+        """Impedisce il riavvio automatico sulla call corrente finché non termina."""
+        with self._lock:
+            self._suppress_until_call_ends = True
+            self._manual_recording = False
+            self._finalize_requested = False
+            self._manual_start_requested = False
+            self._manual_finalize_requested = False
+            self._recording_paused = False
+            self.candidate_started_at_monotonic = None
+            self.last_active_at_monotonic = None
+            self.grace_started_at_monotonic = None
+            self.last_confidence_score = 0.0
+            self._transition(
+                Stage.IDLE,
+                "Registrazione interrotta dall'utente; in attesa fine chiamata.",
+            )
+
     def request_manual_start(self) -> None:
         """Richiede l'avvio immediato della registrazione bypassando score e debounce."""
         with self._lock:
+            self._manual_recording = True
             self._manual_start_requested = True
 
     def request_finalize(self) -> None:
         """Richiede la finalizzazione immediata della sessione corrente."""
         with self._lock:
+            self._finalize_requested = True
             self._manual_finalize_requested = True
 
     def reset_to_idle(self, detail: str = "In attesa di call Microsoft Teams") -> None:
         """Riporta il watcher nello stato IDLE azzerando i contatori e lo comunica al reporter."""
         with self._lock:
             self._stage = Stage.IDLE
+            self._manual_recording = False
+            self._finalize_requested = False
             self._manual_start_requested = False
             self._manual_finalize_requested = False
+            self._recording_paused = False
             self.candidate_started_at_monotonic = None
             self.last_active_at_monotonic = None
             self.grace_started_at_monotonic = None
@@ -828,19 +931,20 @@ class TeamsCallWatcher:
             }
         )
 
-    def step(self) -> None:
+    def step(self) -> WatcherSnapshot:
         """Esegue un singolo passo deterministico di valutazione del watcher."""
         actions: list[Callable[[], None]] = []
         with self._lock:
-            self._step_locked(float(self._clock()), actions)
+            snapshot = self._step_locked(float(self._clock()), actions)
         for action in actions:
             action()
+        return snapshot
 
     def _transition(self, stage: Stage, detail: str) -> None:
         self._stage = stage
         self._stage_reporter.set_stage(stage, detail)
 
-    def _step_locked(self, now_mono: float, actions: list[Callable[[], None]]) -> None:
+    def _step_locked(self, now_mono: float, actions: list[Callable[[], None]]) -> WatcherSnapshot:
         if self._manual_finalize_requested:
             self._manual_finalize_requested = False
             if self._stage in (
@@ -852,11 +956,19 @@ class TeamsCallWatcher:
                 self.grace_started_at_monotonic = None
                 self._transition(Stage.FINALIZING_AUDIO, "Finalizzazione manuale richiesta")
                 actions.append(lambda: self._on_call_ended(ShutdownReason.USER_REQUEST))
-                return
+                return WatcherSnapshot(
+                    state=Stage.FINALIZING_AUDIO,
+                    transition=WatcherTransition.CALL_ENDED,
+                    reason="Finalizzazione manuale richiesta",
+                )
             if self._stage == Stage.START_DEBOUNCE:
                 self.candidate_started_at_monotonic = None
                 self._transition(Stage.IDLE, "Avvio annullato manualmente")
-                return
+                return WatcherSnapshot(
+                    state=Stage.IDLE,
+                    transition=WatcherTransition.NONE,
+                    reason="Avvio annullato manualmente",
+                )
 
         if self._manual_start_requested:
             self._manual_start_requested = False
@@ -868,18 +980,57 @@ class TeamsCallWatcher:
                 self.last_confidence_score = 1.0
                 self._transition(Stage.RECORDING, f"Registrazione manuale: {metadata.title}")
                 actions.append(lambda: self._on_call_started(metadata, True))
-                return
+                return WatcherSnapshot(
+                    state=Stage.RECORDING,
+                    transition=WatcherTransition.CALL_STARTED,
+                    reason=f"Registrazione manuale: {metadata.title}",
+                )
             if self._stage == Stage.GRACE_PERIOD:
                 self.grace_started_at_monotonic = None
                 self.last_active_at_monotonic = now_mono
                 self._transition(Stage.RECORDING, "Registrazione ripresa manualmente")
                 actions.append(self._on_call_resumed)
-                return
+                return WatcherSnapshot(
+                    state=Stage.RECORDING,
+                    transition=WatcherTransition.CALL_RESUMED,
+                    reason="Registrazione ripresa manualmente",
+                )
+
+        if self._recording_paused and self._stage in (
+            Stage.RECORDING,
+            Stage.RECORDING_AND_TRANSCRIBING,
+            Stage.GRACE_PERIOD,
+        ):
+            self.grace_started_at_monotonic = None
+            if self._stage == Stage.GRACE_PERIOD:
+                self._transition(Stage.RECORDING, "Registrazione in pausa manuale")
+            self.last_active_at_monotonic = now_mono
+            return WatcherSnapshot(
+                state=self._stage,
+                transition=WatcherTransition.NONE,
+                reason="Registrazione in pausa manuale",
+            )
 
         call_signal_active, signals = self._is_call_signal_active()
         self.last_signals = signals
 
         if self._stage in (Stage.IDLE, Stage.START_DEBOUNCE):
+            if self._suppress_until_call_ends:
+                if not call_signal_active:
+                    self._suppress_until_call_ends = False
+                return WatcherSnapshot(
+                    state=self._stage,
+                    transition=WatcherTransition.NONE,
+                    reason="Call soppressa fino al termine",
+                )
+
+            if not self._auto_detect_enabled:
+                return WatcherSnapshot(
+                    state=self._stage,
+                    transition=WatcherTransition.NONE,
+                    reason="Rilevamento automatico disabilitato",
+                )
+
             if not call_signal_active:
                 self.last_confidence_score = self._score(
                     signals, debounce_completed=False, outlook_event=False
@@ -890,7 +1041,11 @@ class TeamsCallWatcher:
                         Stage.IDLE,
                         "Segnale Teams interrotto prima del completamento debounce",
                     )
-                return
+                return WatcherSnapshot(
+                    state=self._stage,
+                    transition=WatcherTransition.NONE,
+                    reason="Segnale Teams assente",
+                )
 
             self.last_active_at_monotonic = now_mono
             if self.candidate_started_at_monotonic is None:
@@ -903,7 +1058,11 @@ class TeamsCallWatcher:
                         Stage.START_DEBOUNCE,
                         f"Verifica stabilità call ({int(math.ceil(self._start_debounce_sec))}s)",
                     )
-                    return
+                    return WatcherSnapshot(
+                        state=Stage.START_DEBOUNCE,
+                        transition=WatcherTransition.NONE,
+                        reason=f"Verifica stabilità call ({int(math.ceil(self._start_debounce_sec))}s)",
+                    )
 
             elapsed_debounce = now_mono - self.candidate_started_at_monotonic
             if elapsed_debounce < self._start_debounce_sec:
@@ -915,7 +1074,11 @@ class TeamsCallWatcher:
                     Stage.START_DEBOUNCE,
                     f"Verifica stabilità call ({int(math.ceil(remaining_debounce))}s)",
                 )
-                return
+                return WatcherSnapshot(
+                    state=Stage.START_DEBOUNCE,
+                    transition=WatcherTransition.NONE,
+                    reason=f"Verifica stabilità call ({int(math.ceil(remaining_debounce))}s)",
+                )
 
             metadata = self._resolve_start_metadata()
             score = self._score(
@@ -929,20 +1092,37 @@ class TeamsCallWatcher:
                 self.grace_started_at_monotonic = None
                 self._transition(Stage.RECORDING, f"Registrazione attiva: {metadata.title}")
                 actions.append(lambda: self._on_call_started(metadata, False))
-            return
+                return WatcherSnapshot(
+                    state=Stage.RECORDING,
+                    transition=WatcherTransition.CALL_STARTED,
+                    reason=f"Registrazione attiva: {metadata.title}",
+                )
+            return WatcherSnapshot(
+                state=self._stage,
+                transition=WatcherTransition.NONE,
+                reason="Score insufficiente",
+            )
 
         if self._stage in (Stage.RECORDING, Stage.RECORDING_AND_TRANSCRIBING):
             if call_signal_active:
                 self.last_active_at_monotonic = now_mono
                 self.grace_started_at_monotonic = None
-                return
+                return WatcherSnapshot(
+                    state=self._stage,
+                    transition=WatcherTransition.NONE,
+                    reason="Call attiva",
+                )
 
             self.grace_started_at_monotonic = now_mono
             if self._stop_grace_period_sec <= 0.0:
                 self.grace_started_at_monotonic = None
                 self._transition(Stage.FINALIZING_AUDIO, "Call terminata, finalizzazione audio")
                 actions.append(lambda: self._on_call_ended(ShutdownReason.GRACE_EXPIRED))
-                return
+                return WatcherSnapshot(
+                    state=Stage.FINALIZING_AUDIO,
+                    transition=WatcherTransition.CALL_ENDED,
+                    reason="Call terminata, finalizzazione audio",
+                )
 
             remaining = float(self._stop_grace_period_sec)
             self._transition(
@@ -950,7 +1130,11 @@ class TeamsCallWatcher:
                 f"Call in pausa o terminata ({int(math.ceil(remaining))}s alla chiusura)",
             )
             actions.append(lambda: self._on_call_suspected_end(remaining))
-            return
+            return WatcherSnapshot(
+                state=Stage.GRACE_PERIOD,
+                transition=WatcherTransition.SUSPECTED_END,
+                reason=f"Call in pausa o terminata ({int(math.ceil(remaining))}s alla chiusura)",
+            )
 
         if self._stage == Stage.GRACE_PERIOD:
             if call_signal_active:
@@ -966,10 +1150,18 @@ class TeamsCallWatcher:
                     )
                     actions.append(lambda: self._on_call_ended(ShutdownReason.CALL_ENDED))
                     actions.append(lambda: self._on_call_started(metadata, False))
-                    return
+                    return WatcherSnapshot(
+                        state=Stage.RECORDING,
+                        transition=WatcherTransition.CALL_STARTED,
+                        reason="Nuova call rilevata: chiusura della precedente",
+                    )
                 self._transition(Stage.RECORDING, "Audio call ripreso, registrazione continua")
                 actions.append(self._on_call_resumed)
-                return
+                return WatcherSnapshot(
+                    state=Stage.RECORDING,
+                    transition=WatcherTransition.CALL_RESUMED,
+                    reason="Audio call ripreso, registrazione continua",
+                )
 
             if self.grace_started_at_monotonic is None:
                 self.grace_started_at_monotonic = now_mono
@@ -983,12 +1175,24 @@ class TeamsCallWatcher:
                     "Grace period scaduto, finalizzazione audio",
                 )
                 actions.append(lambda: self._on_call_ended(ShutdownReason.GRACE_EXPIRED))
+                return WatcherSnapshot(
+                    state=Stage.FINALIZING_AUDIO,
+                    transition=WatcherTransition.CALL_ENDED,
+                    reason="Grace period scaduto, finalizzazione audio",
+                )
             else:
                 self._stage_reporter.set_stage(
                     Stage.GRACE_PERIOD,
                     f"Call in pausa o terminata ({int(math.ceil(remaining_grace))}s alla chiusura)",
                 )
                 actions.append(lambda: self._on_call_suspected_end(remaining_grace))
+                return WatcherSnapshot(
+                    state=Stage.GRACE_PERIOD,
+                    transition=WatcherTransition.SUSPECTED_END,
+                    reason=f"Call in pausa o terminata ({int(math.ceil(remaining_grace))}s alla chiusura)",
+                )
+
+        return WatcherSnapshot(state=self._stage, transition=WatcherTransition.NONE)
 
     def _safe_split_check(self) -> bool:
         assert self._split_checker is not None
@@ -1009,3 +1213,8 @@ class TeamsCallWatcher:
             if self._shutdown_event.wait(timeout=self._poll_interval_sec):
                 break
         logger.info("Loop TeamsCallWatcher terminato.")
+
+
+# Alias retrocompatibile
+TeamsAudioWatcher = TeamsCallWatcher
+

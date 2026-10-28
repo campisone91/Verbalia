@@ -64,7 +64,15 @@ def create_desktop_shortcut(
             f'$Shortcut.Description = "Verbalia - Registrazione e verbalizzazione automatica riunioni"; '
             f'$Shortcut.Save()'
         )
-        subprocess.run(["powershell", "-NoProfile", "-Command", ps_script], check=True)
+        creationflags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        subprocess.run(
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps_script],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=creationflags,
+        )
         return shortcut_path
 
 

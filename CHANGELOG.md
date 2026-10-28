@@ -5,7 +5,7 @@ Tutte le modifiche rilevanti a questo progetto sono documentate in questo file.
 Il formato è basato su [Keep a Changelog](https://keepachangelog.com/it/1.1.0/),
 e questo progetto aderisce al [Semantic Versioning](https://semver.org/lang/it/).
 
-## [Non rilasciato] - 2026-10-26
+## [1.0.0] - 2026-10-28
 
 ### Added
 - Registrazione concorrente all'elaborazione: a fine call la cattura si ferma subito e la sessione passa in una coda FIFO persistente servita da un solo worker (`modules/processing.py`), con retry e backoff (3 tentativi) e parcheggio dei job falliti.

@@ -252,6 +252,28 @@ def is_session_locked(session_dir: Path) -> bool:
     return False
 
 
+def acquire_session_owner_lock(session_dir: Path) -> SessionOwnerLock:
+    """Acquisisce il lock esclusivo per la session_dir o solleva SessionLockedError."""
+    lock = SessionOwnerLock(session_dir)
+    if not lock.acquire():
+        raise SessionLockedError(f"Impossibile acquisire il lock per {session_dir}")
+    return lock
+
+
+def release_session_owner_lock(session_dir: Path | SessionOwnerLock) -> None:
+    """Rilascia il lock esclusivo sulla session_dir se attivo."""
+    if isinstance(session_dir, SessionOwnerLock):
+        session_dir.release()
+    else:
+        SessionOwnerLock(session_dir).release()
+
+
+def save_session_state(context: SessionContext) -> None:
+    """Inizializza e salva lo stato iniziale della sessione."""
+    sm = StateManager(context.session_dir)
+    sm.initialize(context)
+
+
 class StateManager:
     """Gestore thread-safe e crash-safe dello stato di sessione su disco."""
 
@@ -468,6 +490,12 @@ class StateManager:
                 if affects_stage and context.stage != Stage.SHUTTING_DOWN:
                     context.stage = Stage.ERROR
                 self.save(context)
+
+    def mark_email_reduce_completed(self, completed: bool = True) -> SessionContext:
+        """Imposta il flag email_reduce_completed nel context della sessione."""
+        def _mut(c: SessionContext) -> None:
+            c.email_reduce_completed = completed
+        return self.mutate(_mut)
 
     def _is_valid_wav_pair(self, path_a: Path, path_b: Path) -> bool:
         """Verifica che entrambi i file WAV di un chunk esistano e abbiano dimensione valida."""

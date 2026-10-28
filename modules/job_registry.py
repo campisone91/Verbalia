@@ -23,6 +23,7 @@ _BUSY_TIMEOUT_MS: int = 5000
 
 # Stati di un job nello storico (lo stage di dettaglio resta quello della state machine)
 JOB_RECORDING = "recording"
+JOB_PAUSED = "paused"
 JOB_QUEUED = "queued"
 JOB_PROCESSING = "processing"
 JOB_COMPLETED = "completed"
@@ -31,6 +32,7 @@ JOB_PARKED = "parked"
 JOB_INTERRUPTED = "interrupted"
 ACTIVE_JOB_STATUSES: tuple[str, ...] = (
     JOB_RECORDING,
+    JOB_PAUSED,
     JOB_QUEUED,
     JOB_PROCESSING,
     JOB_FAILED,
@@ -39,6 +41,7 @@ ACTIVE_JOB_STATUSES: tuple[str, ...] = (
 )
 JOB_STATUS_LABELS_IT: dict[str, str] = {
     JOB_RECORDING: "In registrazione",
+    JOB_PAUSED: "In pausa",
     JOB_QUEUED: "In coda",
     JOB_PROCESSING: "In elaborazione",
     JOB_COMPLETED: "Completato",
@@ -127,6 +130,10 @@ CREATE TABLE IF NOT EXISTS app_status (
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
+);
+CREATE TABLE IF NOT EXISTS deleted_jobs (
+    session_id TEXT PRIMARY KEY,
+    deleted_at TEXT NOT NULL
 );
 """
 
@@ -271,6 +278,8 @@ class JobRegistry:
                 (session_id, _iso(now_tz()), kind, stage, detail),
             )
 
+    append_event = add_event
+
     def get_job(self, session_id: str) -> dict[str, object] | None:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM jobs WHERE session_id=?", (session_id,)).fetchone()
@@ -348,10 +357,28 @@ class JobRegistry:
             durations.append((str(event.get("stage")), max(0.0, (nxt - start).total_seconds())))
         return durations
 
-    def delete_job(self, session_id: str) -> None:
+    def delete_job(self, session_id: str) -> dict[str, object] | None:
+        """Elimina completamente il job e i suoi eventi dal registro e segna il tombstone in deleted_jobs."""
+        at = _iso(now_tz()) or ""
         with self._write_lock, self._connect() as conn:
+            row = conn.execute("SELECT * FROM jobs WHERE session_id=?", (session_id,)).fetchone()
+            existing = dict(row) if row is not None else None
             conn.execute("DELETE FROM job_events WHERE session_id=?", (session_id,))
             conn.execute("DELETE FROM jobs WHERE session_id=?", (session_id,))
+            conn.execute(
+                "INSERT OR REPLACE INTO deleted_jobs (session_id, deleted_at) VALUES (?, ?)",
+                (session_id, at),
+            )
+            return existing
+
+    def is_deleted(self, session_id: str) -> bool:
+        """Restituisce True se la sessione è stata eliminata definitivamente dall'utente."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM deleted_jobs WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            return row is not None
 
     def purge_older_than(self, days: int) -> int:
         """Retention: elimina i job conclusi più vecchi di `days` giorni."""
@@ -482,7 +509,7 @@ class JobRegistry:
         sessions = parse_sessions_from_log(source)
         imported = 0
         for session_id, info in sessions.items():
-            if self.get_job(session_id) is not None:
+            if self.is_deleted(session_id) or self.get_job(session_id) is not None:
                 continue
             name = info.get("docx_path")
             if isinstance(name, str) and name:

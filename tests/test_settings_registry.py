@@ -101,7 +101,7 @@ def test_all_settings_fields_have_help_text_and_dashboard_renders_them(tmp_path:
             assert help_text, f"Campo {group_field.name}.{item.name} privo di help_text"
             assert len(help_text) >= 20, f"help_text troppo breve per {group_field.name}.{item.name}"
 
-    assert total_fields == 27
+    assert total_fields == 33
 
     try:
         import tkinter as tk
@@ -124,7 +124,7 @@ def test_all_settings_fields_have_help_text_and_dashboard_renders_them(tmp_path:
                                     txt = w.cget("text")
                                     if txt:
                                         rendered_help.append(txt)
-        assert len(rendered_help) == 27
+        assert len(rendered_help) == 33
         app._setting_vars.clear()
     finally:
         root.destroy()
@@ -369,3 +369,62 @@ def test_log_session_id_is_per_thread(_isolated_logging: Path) -> None:
     assert "session=SESS_A | messaggio da SESS_A" in text
     assert "session=SESS_B | messaggio da SESS_B" in text
     assert "session=GLOBALE | messaggio principale" in text
+
+
+def test_incognito_mode_tray_and_notifications(tmp_path: Path) -> None:
+    """Verifica impostazione incognito mode e cancellazione ultimo docx su StageMonitorTray."""
+    from modules.tray_ui import StageMonitorTray
+
+    tray = StageMonitorTray(output_dir=tmp_path / "output", headless=True)
+    assert tray.is_incognito_mode() is False
+
+    tray.set_incognito_mode(True)
+    assert tray.is_incognito_mode() is True
+
+    # Test clear_last_output_file_if_matches
+    docx_file = tmp_path / "output" / "test.docx"
+    docx_file.parent.mkdir(parents=True, exist_ok=True)
+    docx_file.write_bytes(b"test")
+    tray.set_last_output_file(docx_file)
+    assert tray.last_output_file == docx_file.resolve()
+
+    tray.clear_last_output_file_if_matches(tmp_path / "output" / "other.docx")
+    assert tray.last_output_file == docx_file.resolve()
+
+    tray.clear_last_output_file_if_matches(docx_file)
+    assert tray.last_output_file is None
+
+
+def test_purge_session_files_and_delete_job(tmp_path: Path) -> None:
+    """Verifica purge_session_files e delete_job di orchestrator."""
+    from modules.job_registry import JobRegistry
+    from modules.orchestrator import MeetingScribeApplication, purge_session_files
+
+    temp_root = tmp_path / "temp"
+    out_root = tmp_path / "output"
+    sess_dir = temp_root / "session_test123"
+    sess_dir.mkdir(parents=True, exist_ok=True)
+    (sess_dir / "state.json").write_text("{}", encoding="utf-8")
+    docx_file = out_root / "2026-10-27" / "test123_Recap.docx"
+    docx_file.parent.mkdir(parents=True, exist_ok=True)
+    docx_file.write_bytes(b"word content")
+
+    t_del, d_del = purge_session_files("test123", session_dir=sess_dir, docx_path=docx_file, temp_root=temp_root)
+    assert t_del is True
+    assert d_del is True
+    assert not sess_dir.exists()
+    assert not docx_file.exists()
+
+    # Test delete_job orchestrator
+    reg = JobRegistry(tmp_path / "db.sqlite")
+    reg.upsert_job("sess_del", title="Meeting To Delete")
+    app = MeetingScribeApplication(
+        headless=True,
+        output_dir=out_root,
+        temp_dir=temp_root,
+        consent_path=tmp_path / "consent.json",
+        registry=reg,
+    )
+    app.delete_job("sess_del")
+    assert reg.is_deleted("sess_del") is True
+    assert reg.get_job("sess_del") is None

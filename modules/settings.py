@@ -28,19 +28,30 @@ def _spec(
     *,
     minimum: float | None = None,
     maximum: float | None = None,
+    min_value: float | None = None,
+    max_value: float | None = None,
     choices: tuple[str, ...] | None = None,
     restart: bool = False,
     help_text: str = "",
+    ui_widget: str | None = None,
 ) -> dict[str, Any]:
     """Metadati di un campo: usati sia per la validazione sia per costruire il form del cruscotto."""
-    return {
+    eff_min = minimum if minimum is not None else min_value
+    eff_max = maximum if maximum is not None else max_value
+    data: dict[str, Any] = {
         "label": label,
-        "min": minimum,
-        "max": maximum,
+        "min": eff_min,
+        "max": eff_max,
         "choices": choices,
         "restart": restart,
         "help": help_text,
     }
+    if ui_widget:
+        data["ui_widget"] = ui_widget
+    return data
+
+
+_meta = _spec
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +100,37 @@ class DetectionSettings:
                 "Rileva l'uso effettivo del microfono da parte di Teams tramite API Windows. "
                 "Attivo evita registrazioni a vuoto (es. Teams aperto inattivo); disattivare solo se il microfono non viene rilevato."
             ),
+        ),
+    )
+    auto_record_teams_calls: bool = field(
+        default=True,
+        metadata=_spec(
+            "Registra automaticamente le chiamate Teams",
+            help_text=(
+                "Avvia e ferma la registrazione automaticamente quando rileva una chiamata Microsoft Teams attiva. "
+                "Se disattivato, la registrazione può essere avviata solo manualmente dal menu della tray."
+            ),
+        ),
+    )
+    incognito_mode: bool = field(
+        default=False,
+        metadata=_spec(
+            "Modalità in incognito (zero popup)",
+            help_text=(
+                "Disattiva qualsiasi popup, notifica toast di Windows o finestra di avviso in tutte le fasi "
+                "(avvio, registrazione, riconoscimento riunione, completamento ed errori)."
+            ),
+        ),
+    )
+    pause_hotkey_enabled: bool = field(
+        default=_config.PAUSE_HOTKEY_ENABLED_DEFAULT,
+        metadata=_meta(
+            "Scorciatoia globale Pausa/Ripresa (Ctrl+Alt+P)",
+            help_text=(
+                "Quando attiva, registra la scorciatoia globale di Windows Ctrl+Alt+P per "
+                "mettere in pausa o riprendere rapidamente la registrazione live in qualsiasi momento."
+            ),
+            ui_widget="checkbox",
         ),
     )
 
@@ -168,6 +210,43 @@ class WhisperSettings:
                 "Codice lingua principale dell'audio (es. 'it', 'en'). "
                 "Fissare 'it' previene allucinazioni su silenzi e rumori; modificare solo per riunioni svolte in un'altra lingua."
             ),
+        ),
+    )
+    diarization_enabled: bool = field(
+        default=_config.DIARIZATION_ENABLED_DEFAULT,
+        metadata=_meta(
+            "Distingui interlocutori remoti sulla traccia [ALTRI]",
+            help_text=(
+                "Analizza le caratteristiche vocali della traccia [ALTRI] per distinguere più partecipanti "
+                "remoti (es. [INTERLOCUTORE 1], [INTERLOCUTORE 2]) mantenendo la memoria tra i chunk da 15 minuti."
+            ),
+            ui_widget="checkbox",
+        ),
+    )
+    diarization_max_speakers: int = field(
+        default=_config.DIARIZATION_MAX_SPEAKERS,
+        metadata=_meta(
+            "Numero massimo interlocutori remoti",
+            min_value=2,
+            max_value=15,
+            help_text=(
+                "Limite massimo di interlocutori distinti identificabili sulla traccia [ALTRI] durante una "
+                "singola riunione (valori consigliati: da 2 a 10)."
+            ),
+            ui_widget="spinbox",
+        ),
+    )
+    diarization_similarity_threshold: float = field(
+        default=_config.DIARIZATION_SIMILARITY_THRESHOLD,
+        metadata=_meta(
+            "Soglia similarità vocale interlocutori",
+            min_value=0.45,
+            max_value=0.90,
+            help_text=(
+                "Soglia di similarità coseno (tra 0.45 e 0.90) per associare un segmento a un interlocutore "
+                "già noto anziché crearne uno nuovo. Valori più bassi riducono la frammentazione dei parlanti."
+            ),
+            ui_widget="spinbox",
         ),
     )
 
@@ -408,6 +487,9 @@ def default_settings() -> AppSettings:
             stop_grace_period_sec=int(_config.STOP_GRACE_PERIOD_SEC),
             outlook_match_tolerance_min=int(_config.OUTLOOK_MATCH_TOLERANCE_MIN),
             use_mic_signal=bool(_config.WATCHER_USE_MIC_SIGNAL),
+            auto_record_teams_calls=True,
+            incognito_mode=bool(getattr(_config, "INCOGNITO_MODE", False)),
+            pause_hotkey_enabled=bool(getattr(_config, "PAUSE_HOTKEY_ENABLED_DEFAULT", True)),
         ),
         audio=AudioSettings(
             chunk_duration_sec=int(_config.CHUNK_DURATION_SEC),
@@ -418,6 +500,9 @@ def default_settings() -> AppSettings:
             cpu_threads=int(_config.WHISPER_CPU_THREADS),
             beam_size=int(_config.WHISPER_BEAM_SIZE),
             language=str(_config.WHISPER_LANGUAGE),
+            diarization_enabled=bool(getattr(_config, "DIARIZATION_ENABLED_DEFAULT", True)),
+            diarization_max_speakers=int(getattr(_config, "DIARIZATION_MAX_SPEAKERS", 8)),
+            diarization_similarity_threshold=float(getattr(_config, "DIARIZATION_SIMILARITY_THRESHOLD", 0.68)),
         ),
         ollama=OllamaSettings(
             base_url=str(_config.OLLAMA_BASE_URL),
@@ -591,3 +676,25 @@ def to_summarizer_options(settings: AppSettings) -> SummarizerOptions:
         user_name=resolve_user_display_name(settings.output.user_display_name),
         streaming=bool(_config.OLLAMA_STREAMING),
     )
+
+
+def apply_to_config(settings: AppSettings) -> None:
+    """Propaga le impostazioni correnti nel modulo config."""
+    _config.START_DEBOUNCE_SEC = int(settings.detection.start_debounce_sec)
+    _config.STOP_GRACE_PERIOD_SEC = int(settings.detection.stop_grace_period_sec)
+    if hasattr(settings.detection, "confidence_threshold"):
+        _config.TEAMS_CONFIDENCE_THRESHOLD = float(getattr(settings.detection, "confidence_threshold"))
+    _config.OUTLOOK_MATCH_TOLERANCE_MIN = int(settings.detection.outlook_match_tolerance_min)
+    _config.WATCHER_USE_MIC_SIGNAL = bool(settings.detection.use_mic_signal)
+    _config.INCOGNITO_MODE = bool(getattr(settings.detection, "incognito_mode", False))
+    _config.PAUSE_HOTKEY_ENABLED_DEFAULT = bool(getattr(settings.detection, "pause_hotkey_enabled", True))
+    _config.DIARIZATION_ENABLED_DEFAULT = bool(getattr(settings.whisper, "diarization_enabled", True))
+    _config.DIARIZATION_MAX_SPEAKERS = int(getattr(settings.whisper, "diarization_max_speakers", 8))
+    _config.DIARIZATION_SIMILARITY_THRESHOLD = float(getattr(settings.whisper, "diarization_similarity_threshold", 0.68))
+
+
+def apply_settings(path: Path | None = None) -> AppSettings:
+    """Carica settings.json, propaga a config e restituisce le impostazioni."""
+    settings = load_settings(path)
+    apply_to_config(settings)
+    return settings

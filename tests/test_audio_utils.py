@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 from modules.audio_utils import (
+    WavFileInfo,
     build_ffmpeg_normalize_command,
     calculate_missing_frames,
     compute_silence_injection_frames,
@@ -14,8 +15,10 @@ from modules.audio_utils import (
     discover_audio_devices,
     generate_silence_bytes,
     get_wav_duration_sec,
+    inspect_wav_file,
     is_valid_normalized_wav,
     normalize_wav_with_ffmpeg,
+    prepare_imported_audio_session,
     split_wav_file,
     validate_normalized_wav,
 )
@@ -209,4 +212,44 @@ def test_discover_audio_devices_fallback_enumeration() -> None:
     assert mic.name == "USB Microphone"
     assert loop.name == "Default Speakers [Loopback]"
     assert loop.is_loopback is True
+
+
+def test_inspect_wav_file(tmp_path: Path) -> None:
+    """Verifica che inspect_wav_file legga correttamente metadati e durata."""
+    wav_path = create_silent_wav(tmp_path / "sample.wav", duration_sec=3.0, sample_rate=16000, channels=1)
+    info = inspect_wav_file(wav_path)
+    assert info.sample_rate == 16000
+    assert info.channels == 1
+    assert info.sample_width == 2
+    assert abs(info.duration_sec - 3.0) < 0.05
+    assert info.frames == 48000
+
+
+def test_prepare_imported_audio_session(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verifica che prepare_imported_audio_session prepari la cartella, i chunk e salvi lo state."""
+    raw_wav = create_silent_wav(tmp_path / "input.wav", duration_sec=5.0)
+
+    def _mock_normalize(_ffmpeg: object, _src: Path, dst: Path, **_kwargs: object) -> Path:
+        return create_silent_wav(dst, duration_sec=5.0)
+
+    monkeypatch.setattr("modules.audio_utils.normalize_wav_with_ffmpeg", _mock_normalize)
+
+    temp_root = tmp_path / "temp_sessions"
+    context = prepare_imported_audio_session(
+        input_audio_path=raw_wav,
+        temp_dir=temp_root,
+        chunk_duration_sec=2,
+        overlap_sec=0,
+    )
+
+    assert context.session_dir.exists()
+    assert (context.session_dir / "state.json").is_file()
+    assert (context.session_dir / "audio").is_dir()
+    assert len(context.recorded_chunks) == 3
+    for idx in context.recorded_chunks:
+        io_wav = context.session_dir / "audio" / f"chunk_{idx:03d}_io_16k.wav"
+        others_wav = context.session_dir / "audio" / f"chunk_{idx:03d}_altri_16k.wav"
+        assert io_wav.exists()
+        assert others_wav.exists()
+
 

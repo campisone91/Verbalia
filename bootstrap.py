@@ -18,7 +18,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME: str = "Verbalia"
-APP_VERSION: str = "0.1.0"
+APP_VERSION: str = "1.0.0"
 STATE_SCHEMA_VERSION: int = 1
 MIN_PYTHON_VERSION: tuple[int, int] = (3, 10)
 
@@ -260,7 +260,7 @@ def install_requirements(requirements_path: Path) -> None:
     in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
     _ = in_venv
 
-    subprocess.check_call(
+    subprocess.run(
         [
             sys.executable,
             "-m",
@@ -268,9 +268,14 @@ def install_requirements(requirements_path: Path) -> None:
             "install",
             "--upgrade",
             "pip",
-        ]
+        ],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=_windows_creation_flags(),
     )
-    subprocess.check_call(
+    subprocess.run(
         [
             sys.executable,
             "-m",
@@ -278,7 +283,12 @@ def install_requirements(requirements_path: Path) -> None:
             "install",
             "-r",
             str(requirements_path),
-        ]
+        ],
+        check=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=_windows_creation_flags(),
     )
 
 
@@ -722,6 +732,10 @@ def ensure_ollama_ready(base_url: str, model_name: str) -> None:
                     model_name,
                 ],
                 check=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=_windows_creation_flags(),
             )
         except (OSError, subprocess.SubprocessError) as exc:
             sys.stderr.write(

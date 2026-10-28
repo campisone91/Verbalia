@@ -5,6 +5,7 @@ import math
 import re
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Final
 
 from config import (
     CHUNK_OVERLAP_SEC,
@@ -24,12 +25,8 @@ from modules.contracts import (
     sha256_file,
 )
 
-TRANSCRIPT_LINE_RE: re.Pattern[str] = re.compile(
-    r"^\[(?P<h>\d{2}):"
-    r"(?P<m>\d{2}):"
-    r"(?P<s>\d{2})\] "
-    r"\[(?P<label>IO|ALTRI)\]: "
-    r"(?P<text>.+)$"
+TRANSCRIPT_LINE_RE: Final[re.Pattern[str]] = re.compile(
+    r"^\[(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})\] \[(?P<label>IO|ALTRI|INTERLOCUTORE\s+\d+)\]: (?P<text>.+)$"
 )
 
 NO_SPEECH_MARKER: str = "[NESSUN PARLATO RILEVATO]"
@@ -74,8 +71,9 @@ def parse_timestamp_hms(hms: str) -> float:
     return float(hours * 3600 + minutes * 60 + seconds)
 
 
-def parse_transcript_line(line: str) -> TranscriptSegment | None:
+def parse_transcript_line(line: str, chunk_index: int = 0) -> TranscriptSegment | None:
     """Analizza una riga di transcript e restituisce TranscriptSegment o None."""
+    _ = chunk_index
     stripped = line.strip()
     if not stripped or stripped.startswith("#") or stripped == NO_SPEECH_MARKER:
         return None
@@ -87,26 +85,38 @@ def parse_transcript_line(line: str) -> TranscriptSegment | None:
     seconds = int(match.group("s"))
     if minutes >= 60 or seconds >= 60:
         return None
-    label_raw = match.group("label")
+    label_raw = match.group("label").strip()
     text = match.group("text").strip()
     if not text:
         return None
+    if label_raw == "IO":
+        track = TrackLabel.IO
+        speaker = None
+    elif label_raw == "ALTRI":
+        track = TrackLabel.OTHERS
+        speaker = None
+    elif label_raw.startswith("INTERLOCUTORE"):
+        track = TrackLabel.OTHERS
+        speaker = " ".join(label_raw.split())
+    else:
+        return None
     timestamp_sec = float(hours * 3600 + minutes * 60 + seconds)
     return TranscriptSegment(
-        track=TrackLabel(label_raw),
+        track=track,
         start_sec=timestamp_sec,
         end_sec=timestamp_sec,
         text=text,
+        speaker=speaker,
     )
 
 
 def format_transcript_segment(segment: TranscriptSegment) -> str:
-    """Formatta un TranscriptSegment nel formato [HH:MM:SS] [IO|ALTRI]: <text>."""
+    """Formatta un TranscriptSegment nel formato [HH:MM:SS] [IO|ALTRI|INTERLOCUTORE X]: <text>."""
     clean_text = " ".join(segment.text.splitlines()).strip()
     if not clean_text:
         raise ValueError("Il testo del segmento non può essere vuoto.")
     hms = format_timestamp_hms(max(0.0, segment.start_sec))
-    return f"[{hms}] [{segment.track.value}]: {clean_text}"
+    return f"[{hms}] [{segment.display_label}]: {clean_text}"
 
 
 def format_chunk_transcript(
