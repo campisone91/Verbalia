@@ -495,8 +495,24 @@ def _coerce_outlook_datetime(
     if raw_dt is None:
         return None
     if isinstance(raw_dt, datetime):
-        if raw_dt.tzinfo is None:
-            return raw_dt.replace(tzinfo=reference_tz_dt.tzinfo)
+        tz = raw_dt.tzinfo
+        # pywin32 restituisce pywintypes.datetime per item.Start/End con l'ora locale
+        # ma con tzinfo=TimeZoneInfo('GMT Standard Time', True) (+00:00): non va convertito con astimezone.
+        if (
+            tz is None
+            or type(raw_dt).__module__.startswith("pywintypes")
+            or type(tz).__name__ == "TimeZoneInfo"
+        ):
+            return datetime(
+                raw_dt.year,
+                raw_dt.month,
+                raw_dt.day,
+                raw_dt.hour,
+                raw_dt.minute,
+                raw_dt.second,
+                raw_dt.microsecond,
+                tzinfo=reference_tz_dt.tzinfo,
+            )
         return raw_dt.astimezone(reference_tz_dt.tzinfo)
     if isinstance(raw_dt, str) and raw_dt.strip():
         try:
@@ -517,13 +533,20 @@ def _outlook_match_sort_key(
 ) -> tuple[int, float, float] | None:
     """Classifica un appuntamento rispetto all'istante di riferimento; None se fuori tolleranza.
 
-    0 = in corso, 1 = inizia entro la tolleranza, 2 = terminato da meno della tolleranza.
+    0 = in corso (non in coda finale),
+    1 = inizia entro la tolleranza oppure in corso ma in coda finale (confrontati per vicinanza all'inizio),
+    2 = terminato da meno della tolleranza.
     """
-    if item_start <= ref_time <= item_end:
-        category = 0
+    if item_start <= ref_time < item_end:
+        elapsed = ref_time - item_start
+        remaining = item_end - ref_time
+        if remaining <= tolerance and elapsed > remaining:
+            category = 1
+        else:
+            category = 0
     elif ref_time < item_start <= ref_time + tolerance:
         category = 1
-    elif item_end < ref_time <= item_end + tolerance:
+    elif item_end <= ref_time <= item_end + tolerance:
         category = 2
     else:
         return None

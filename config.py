@@ -7,7 +7,7 @@ from typing import Final
 
 # 8.1 Metadati
 APP_NAME: str = "Verbalia"
-APP_VERSION: str = "1.0.0"
+APP_VERSION: str = "1.0.1"
 STATE_SCHEMA_VERSION: int = 1
 MIN_PYTHON_VERSION: tuple[int, int] = (3, 10)
 

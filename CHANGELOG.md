@@ -5,6 +5,18 @@ Tutte le modifiche rilevanti a questo progetto sono documentate in questo file.
 Il formato è basato su [Keep a Changelog](https://keepachangelog.com/it/1.1.0/),
 e questo progetto aderisce al [Semantic Versioning](https://semver.org/lang/it/).
 
+## [1.0.1] - 2026-10-28
+
+### Added
+- Installer automatico con interfaccia testuale interattiva (TUI) e modalità CLI (`tools/installer.py`, `install.bat`): supporto per installazione guidata o selettiva di Python, dipendenze pip, FFmpeg, Whisper (CTranslate2/ONNX Runtime e modelli), installazione silenziosa di Ollama e pull del modello `llama3.1:8b`, con test end-to-end su campione audio e creazione del collegamento Desktop.
+- Suite di test automatizzati per l'installer (`tests/test_installer.py`).
+- Funzione di installazione silenziosa di Ollama (`install_ollama_silently`) e verifica cache modelli Whisper in `bootstrap.py`.
+
+### Fixed
+- Risolto bug di associazione riunioni Outlook in `_coerce_outlook_datetime`: corretto l'offset orario spurio di `pywintypes.datetime` (`TimeZoneInfo('GMT Standard Time', True)`) che causava una conversione `.astimezone()` errata (+1h/+2h), facendo associare la riunione precedente anziché quella corrente.
+- Raffinata la logica di prioritizzazione `_outlook_match_sort_key` per call consecutive (back-to-back): una call in imminente chiusura non prevale più sulla call successiva se l'utente accede con qualche minuto di anticipo.
+- Polling Outlook durante il `GRACE_PERIOD` ridotto da 30s a 5s ed esteso anche alle sessioni avviate con metadati di fallback per consentire lo split tempestivo.
+
 ## [1.0.0] - 2026-10-28
 
 ### Added

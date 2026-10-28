@@ -141,7 +141,7 @@ from modules.watcher import TeamsCallWatcher, fetch_outlook_meeting_metadata
 
 DRY_RUN_MARKER: str = "CONTENUTO SINTETICO DI TEST"
 _STATUS_PUBLISH_INTERVAL_SEC: float = 2.0
-_GRACE_MEETING_PROBE_INTERVAL_SEC: float = 30.0
+_GRACE_MEETING_PROBE_INTERVAL_SEC: float = 5.0
 
 
 class RecorderLike(Protocol):
@@ -400,7 +400,7 @@ class RecordingController:
 
     def on_call_suspected_end(self, _remaining_sec: float) -> None:
         live = self._app.live
-        if live is None or live.metadata.source != "outlook":
+        if live is None or live.metadata.source not in ("outlook", "fallback"):
             return
         with self._grace_lock:
             if self._grace_thread is not None and self._grace_thread.is_alive():
@@ -438,14 +438,21 @@ class RecordingController:
         live = self._app.live
         with self._grace_lock:
             current = self._grace_meeting
-        if live is None or current is None:
+        if live is None or current is None or current.source != "outlook":
             return False
-        if live.metadata.source != "outlook" or current.source != "outlook":
+        if current.scheduled_end is not None and current.scheduled_end <= now_tz():
             return False
-        return (current.title, current.scheduled_start) != (
-            live.metadata.title,
-            live.metadata.scheduled_start,
-        )
+        if live.metadata.source == "outlook":
+            return (current.title, current.scheduled_start) != (
+                live.metadata.title,
+                live.metadata.scheduled_start,
+            )
+        if live.metadata.source == "fallback":
+            return (
+                current.scheduled_start is not None
+                and current.scheduled_start > live.started_at
+            )
+        return False
 
     def on_call_ended(self, reason: ShutdownReason) -> None:
         app = self._app

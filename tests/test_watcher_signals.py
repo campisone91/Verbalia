@@ -272,3 +272,84 @@ def test_reset_to_idle_is_reported() -> None:
     assert reporter.history[-1] == Stage.FINALIZING_AUDIO
     watcher.reset_to_idle()
     assert reporter.history[-1] == Stage.IDLE
+
+
+def test_outlook_pywintypes_local_time_not_shifted_by_fake_utc_tzinfo(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pywin32 restituisce Start/End in ora locale ma con TimeZoneInfo('GMT Standard Time') (+00:00):
+    non deve essere applicato astimezone (+1h/+2h) che associava la call precedente a quella corrente.
+    """
+    from datetime import timezone, tzinfo
+
+    class TimeZoneInfo(tzinfo):
+        """Simula pywintypes.TimeZoneInfo('GMT Standard Time', True) che espone offset 0 su orari locali."""
+
+        def utcoffset(self, _dt: datetime | None) -> timedelta:
+            return timedelta(0)
+
+        def dst(self, _dt: datetime | None) -> timedelta:
+            return timedelta(0)
+
+        def tzname(self, _dt: datetime | None) -> str:
+            return "GMT Standard Time"
+
+    fake_pywin_tz = TimeZoneInfo()
+    cet = timezone(timedelta(hours=1))
+
+    # Come in Outlook COM reale: Start/End contengono 15:00 e 16:00 (ora locale), ma tzinfo è TimeZoneInfo (+00:00)
+    prev_call = _Appointment(
+        "DP Corp - Allocato Conferito",
+        datetime(2026, 10, 28, 15, 0, tzinfo=fake_pywin_tz),
+        datetime(2026, 10, 28, 16, 0, tzinfo=fake_pywin_tz),
+    )
+    curr_call = _Appointment(
+        "Enilive | Internal - Soluzione Monitoraggio - Follow-up",
+        datetime(2026, 10, 28, 16, 0, tzinfo=fake_pywin_tz),
+        datetime(2026, 10, 28, 16, 30, tzinfo=fake_pywin_tz),
+    )
+    _install_fake_outlook(monkeypatch, [prev_call, curr_call])
+
+    # Alle 15:01 deve abbinare la call delle 15:00-16:00
+    ref_1501 = datetime(2026, 10, 28, 15, 1, 45, tzinfo=cet)
+    matched_1501 = fetch_outlook_meeting_metadata(reference_time=ref_1501, tolerance_min=15)
+    assert matched_1501.source == "outlook"
+    assert matched_1501.title == "DP Corp - Allocato Conferito"
+    assert matched_1501.scheduled_start == datetime(2026, 10, 28, 15, 0, tzinfo=cet)
+    assert matched_1501.scheduled_end == datetime(2026, 10, 28, 16, 0, tzinfo=cet)
+
+    # Alle 16:03 deve abbinare la call corrente (16:00-16:30) e NON quella precedente (15:00-16:00)
+    ref_1603 = datetime(2026, 10, 28, 16, 3, 12, tzinfo=cet)
+    matched_1603 = fetch_outlook_meeting_metadata(reference_time=ref_1603, tolerance_min=15)
+    assert matched_1603.source == "outlook"
+    assert matched_1603.title == "Enilive | Internal - Soluzione Monitoraggio - Follow-up"
+    assert matched_1603.scheduled_start == datetime(2026, 10, 28, 16, 0, tzinfo=cet)
+    assert matched_1603.scheduled_end == datetime(2026, 10, 28, 16, 30, tzinfo=cet)
+
+
+def test_outlook_back_to_back_calls_prefers_starting_call_near_boundary(
+    fixed_now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tra due call consecutive (15:00-16:00 e 16:00-16:30), entrando alle 15:58 o alle 16:00
+    viene associata la call entrante delle 16:00 e non quella in chiusura delle 15:00.
+    """
+    base_1500 = fixed_now.replace(hour=15, minute=0, second=0, microsecond=0)
+    call_a = _Appointment("Call Precedente 15-16", base_1500, base_1500 + timedelta(hours=1))
+    call_b = _Appointment(
+        "Call Corrente 16-16:30",
+        base_1500 + timedelta(hours=1),
+        base_1500 + timedelta(hours=1, minutes=30),
+    )
+    _install_fake_outlook(monkeypatch, [call_a, call_b])
+
+    # Ingresso anticipato di 2 minuti (15:58) nella call delle 16:00
+    at_1558 = base_1500 + timedelta(minutes=58)
+    matched_early = fetch_outlook_meeting_metadata(reference_time=at_1558, tolerance_min=15)
+    assert matched_early.title == "Call Corrente 16-16:30"
+
+    # Ingresso esatto al confine d'ora (16:00:00)
+    at_1600 = base_1500 + timedelta(hours=1)
+    matched_boundary = fetch_outlook_meeting_metadata(reference_time=at_1600, tolerance_min=15)
+    assert matched_boundary.title == "Call Corrente 16-16:30"
+

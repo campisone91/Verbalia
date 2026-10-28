@@ -18,7 +18,7 @@ import zipfile
 from pathlib import Path
 
 APP_NAME: str = "Verbalia"
-APP_VERSION: str = "1.0.0"
+APP_VERSION: str = "1.0.1"
 STATE_SCHEMA_VERSION: int = 1
 MIN_PYTHON_VERSION: tuple[int, int] = (3, 10)
 
@@ -59,6 +59,8 @@ OLLAMA_BASE_URL: str = "http://localhost:11434"
 OLLAMA_MODEL: str = "llama3.1:8b"
 OLLAMA_STARTUP_POLL_ATTEMPTS: int = 20
 OLLAMA_STARTUP_POLL_INTERVAL_SEC: float = 0.5
+OLLAMA_DOWNLOAD_URL: str = "https://ollama.com/download/OllamaSetup.exe"
+OLLAMA_INSTALL_TIMEOUT_SEC: int = 600
 
 WHISPER_GPU_MODEL: str = "large-v3-turbo"
 WHISPER_GPU_COMPUTE_TYPE: str = "float16"
@@ -76,6 +78,7 @@ REQUIRED_IMPORTS: dict[str, str] = {
     "win32com": "pywin32",
     "pystray": "pystray",
     "PIL": "Pillow",
+    "onnxruntime": "onnxruntime",
 }
 
 REQUIRED_MARKER_KEYS: frozenset[str] = frozenset(
@@ -670,12 +673,129 @@ def is_tkinter_available() -> bool:
     return spec is not None
 
 
-def ensure_ollama_ready(base_url: str, model_name: str) -> None:
+def install_ollama_silently(temp_dir: Path | None = None) -> str:
+    """Installa Ollama silenziosamente senza intervento umano (winget con fallback a OllamaSetup.exe)."""
+    existing = _find_ollama_executable()
+    if existing:
+        return existing
+
+    # 1. Tentativo tramite winget
+    winget_exe = shutil.which("winget")
+    if winget_exe:
+        try:
+            proc = subprocess.run(
+                [
+                    winget_exe,
+                    "install",
+                    "--id",
+                    "Ollama.Ollama",
+                    "-e",
+                    "--silent",
+                    "--accept-package-agreements",
+                    "--accept-source-agreements",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=OLLAMA_INSTALL_TIMEOUT_SEC,
+                check=False,
+                creationflags=_windows_creation_flags(),
+            )
+            if proc.returncode == 0:
+                found = _find_ollama_executable()
+                if found:
+                    return found
+        except (OSError, subprocess.SubprocessError) as exc:
+            sys.stderr.write(f"Installazione Ollama tramite winget non riuscita: {exc}\n")
+
+    # 2. Fallback: download diretto di OllamaSetup.exe da https://ollama.com/download/OllamaSetup.exe
+    if not OLLAMA_DOWNLOAD_URL.lower().startswith("https://"):
+        raise RuntimeError(f"URL download Ollama non sicuro: {OLLAMA_DOWNLOAD_URL}")
+
+    work_dir = (temp_dir if temp_dir is not None else TEMP_DIR).resolve()
+    work_dir.mkdir(parents=True, exist_ok=True)
+    installer_path = work_dir / "OllamaSetup.exe"
+
+    try:
+        request = urllib.request.Request(
+            OLLAMA_DOWNLOAD_URL,
+            headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+        )
+        with (
+            urllib.request.urlopen(request, timeout=OLLAMA_INSTALL_TIMEOUT_SEC) as response,
+            installer_path.open("wb") as handle,
+        ):
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                handle.write(chunk)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        subprocess.run(
+            [
+                str(installer_path),
+                "/VERYSILENT",
+                "/SUPPRESSMSGBOXES",
+                "/NORESTART",
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=OLLAMA_INSTALL_TIMEOUT_SEC,
+            check=True,
+            creationflags=_windows_creation_flags(),
+        )
+    except Exception as exc:
+        raise RuntimeError(f"Installazione silenziosa di Ollama fallita: {exc}") from exc
+    finally:
+        if installer_path.exists():
+            try:
+                installer_path.unlink()
+            except OSError:
+                pass
+
+    found_after = _find_ollama_executable()
+    if not found_after:
+        raise RuntimeError(
+            "Installazione Ollama terminata ma 'ollama.exe' non è stato trovato nei percorsi standard."
+        )
+    return found_after
+
+
+def check_whisper_model_cached(model_name: str) -> bool:
+    """Verifica se il modello faster-whisper specificato è già presente nella cache locale su disco."""
+    try:
+        fw_utils = importlib.import_module("faster_whisper.utils")
+        download_fn = getattr(fw_utils, "download_model", None)
+        if download_fn is None:
+            return False
+        cached_path = download_fn(model_name, local_files_only=True)
+        return bool(cached_path and Path(str(cached_path)).exists())
+    except Exception:
+        return False
+
+
+def ensure_ollama_ready(
+    base_url: str,
+    model_name: str,
+    *,
+    auto_install: bool = True,
+) -> None:
     """Verifica che il server Ollama risponda e che il modello configurato sia presente."""
     models = _fetch_ollama_models(base_url)
     ollama_exe = _find_ollama_executable()
 
     if models is None:
+        if not ollama_exe and auto_install:
+            try:
+                ollama_exe = install_ollama_silently()
+            except RuntimeError as exc:
+                sys.stderr.write(f"\n[ERRORE INSTALLAZIONE OLLAMA] {exc}\n")
+
         if not ollama_exe:
             sys.stderr.write(
                 f"\n[ERRORE DIPENDENZA] Ollama non è raggiungibile su {base_url} e 'ollama.exe' non è stato trovato nel sistema.\n"
