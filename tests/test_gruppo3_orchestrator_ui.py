@@ -224,6 +224,86 @@ def test_dashboard_ui_pause_button_state_and_command(tmp_path: Path):
         app._cmd_toggle_pause()
         commands2 = registry.fetch_pending_commands()
         assert any(cmd == UiCommandType.RESUME_RECORDING.value for cmd, _ in commands2)
+        app._setting_vars.clear()
+        del app
     finally:
+        import gc
+
+        gc.collect()
         root.destroy()
+        gc.collect()
+
+
+def test_dashboard_auto_refreshes_history_and_keeps_today_completed_in_cruscotto(tmp_path: Path):
+    import gc
+    from datetime import timedelta
+    from modules.contracts import now_tz
+
+    try:
+        import tkinter as tk
+        root = tk.Tk()
+    except Exception:
+        return
+    root.withdraw()
+    try:
+        from modules.dashboard_ui import DashboardApp
+
+        registry = JobRegistry(tmp_path / "dash_sync.db")
+        now = now_tz()
+        call_start = now.replace(hour=min(now.hour, 12), minute=0, second=0, microsecond=0)
+        if call_start > now:
+            call_start = now - timedelta(minutes=5)
+
+        # 1. Job is recording when DashboardApp opens
+        sid = "20261029_123106_c3d9fdd9"
+        registry.upsert_job(
+            sid,
+            title="Call Test 12:31",
+            mode="auto",
+            status="recording",
+            stage=Stage.RECORDING.value,
+            call_started_at=call_start,
+        )
+
+        app = DashboardApp(root, registry, initial_tab="cruscotto")
+        root.update()
+
+        # Verify Storico initially shows "In registrazione"
+        assert sid in app._history_rows
+        assert app._history_rows[sid]["status"] == "recording"
+        hist_vals_before = app.history_tree.item(sid, "values")
+        assert "In registrazione" in hist_vals_before
+
+        # 2. Job completes (>30 min ago in the same day to also verify daily retention in Cruscotto)
+        ended_at = call_start + timedelta(minutes=1)
+        registry.upsert_job(
+            sid,
+            status="completed",
+            stage=Stage.COMPLETED.value,
+            call_ended_at=ended_at,
+            processing_started_at=ended_at,
+            processing_ended_at=ended_at,
+            docx_path=str(tmp_path / "2026-10-29_12-31_Call_Recap.docx"),
+        )
+
+        # 3. Trigger periodic _refresh() without touching Storico filters
+        app._refresh()
+        root.update()
+
+        # Cruscotto still lists today's completed call even if >30 min old
+        assert sid in app._active_jobs
+        assert app.active_tree.exists(sid)
+
+        # Storico automatically updated from "In registrazione" to "Completato"
+        assert app._history_rows[sid]["status"] == "completed"
+        hist_vals_after = app.history_tree.item(sid, "values")
+        assert "Completato" in hist_vals_after
+        assert "2026-10-29_12-31_Call_Recap.docx" in hist_vals_after
+        app._setting_vars.clear()
+        del app
+    finally:
+        gc.collect()
+        root.destroy()
+        gc.collect()
+
 

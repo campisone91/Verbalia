@@ -166,6 +166,33 @@ class SessionStageReporter:
             )
         )
 
+    def progress_steps(
+        self,
+        current: int,
+        total: int,
+        detail_text: str | None = None,
+    ) -> None:
+        """Aggiorna i contatori progress_current/progress_total senza cambiare lo stage corrente."""
+        if self._bus is None:
+            return
+        fields: dict[str, object] = {
+            "progress_current": int(current),
+            "progress_total": int(total),
+        }
+        if detail_text is not None:
+            fields["detail"] = detail_text
+        self._bus.publish(
+            StageEvent(
+                kind=EVENT_PROGRESS,
+                session_id=self.session_id,
+                stage=self.stage,
+                detail=detail_text or "",
+                current=int(current),
+                total=int(total),
+                fields=fields,
+            )
+        )
+
     def _persist(self, stage: Stage, previous: Stage, detail_text: str) -> None:
         sm = self._state_manager
         if not self._persist_enabled or sm is None or sm.closed:

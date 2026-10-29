@@ -202,13 +202,44 @@ def test_queue_badge_icon_and_dashboard_helpers(tmp_path: Path) -> None:
     badged = create_stage_icon_image(Stage.RECORDING, badge_count=3)
     assert plain.tobytes() != badged.tobytes()
 
-    from modules.dashboard_ui import describe_progress, format_duration, pipeline_marks
+    from modules.dashboard_ui import (
+        compute_job_progress_percent,
+        describe_progress,
+        format_duration,
+        pipeline_marks,
+    )
 
     assert format_duration(3725) == "1h 02m"
     assert format_duration(75) == "1m 15s"
-    assert describe_progress(
-        {"stage": "summarizing_map", "progress_current": 3, "progress_total": 6, "tokens_generated": 812}
-    ) == "MAP 3/6 · 812 token"
+    assert compute_job_progress_percent({"status": "recording", "stage": "recording"}) is None
+    assert compute_job_progress_percent({"status": "queued", "stage": "queued"}) == 0
+    assert compute_job_progress_percent({"status": "processing", "stage": "finalizing_audio"}) == 2
+    assert (
+        compute_job_progress_percent(
+            {"status": "processing", "stage": "transcribing_final", "progress_current": 2, "progress_total": 4}
+        )
+        == 25
+    )
+    assert (
+        describe_progress(
+            {"stage": "transcribing_final", "progress_current": 2, "progress_total": 4}
+        )
+        == "25% · Chunk 2/4"
+    )
+    assert (
+        describe_progress(
+            {"stage": "summarizing_map", "progress_current": 3, "progress_total": 6, "tokens_generated": 812}
+        )
+        == "60% · MAP 3/6 · 812 token"
+    )
+    assert (
+        describe_progress(
+            {"stage": "summarizing_reduce", "progress_current": 1, "progress_total": 2, "tokens_generated": 400}
+        )
+        == "79% · REDUCE 1/2 · 400 token"
+    )
+    assert describe_progress({"status": "processing", "stage": "building_docx"}) == "94%"
+    assert describe_progress({"status": "completed", "stage": "completed", "progress_current": 1, "progress_total": 1}) == "100%"
     assert pipeline_marks("summarizing_map", "processing") == ["✓", "✓", "✓", "●", "○", "○", "○"]
     assert pipeline_marks("summarizing_map", "failed")[3] == "✗"
     assert pipeline_marks("cleaning_up", "completed") == ["✓"] * 7
@@ -240,6 +271,8 @@ result = {"active": list(app.active_tree.get_children())}
 app._selected_active = "S1"
 app._refresh_detail()
 result["step_map"] = app.step_vars[3].get()
+result["progress_bar_val"] = int(app.progress_bar["value"])
+result["progress_pct_text"] = app.var_progress_pct.get()
 app._confirm = lambda *args, **kwargs: True
 app._cmd_stop_selected()
 result["commands_after_stop"] = registry.fetch_pending_commands()
@@ -281,6 +314,9 @@ def test_dashboard_window_builds_and_sends_commands(tmp_path: Path) -> None:
         pytest.skip("Display Tk non disponibile")
     assert result["active"] == ["S1"]
     assert result["step_map"].startswith("●")
+    assert result["progress_bar_val"] == 46
+    assert "46%" in result["progress_pct_text"]
+    assert "MAP 1/2" in result["progress_pct_text"]
     assert result["commands_after_stop"] == [["cancel_job", {"session_id": "S1"}]]
     assert result["commands"] == [["start_manual", {}]]
     assert result["history"] == ["S1", "S2"]

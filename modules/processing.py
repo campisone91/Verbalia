@@ -337,9 +337,19 @@ class SessionProcessor:
             raw_others = audio_dir / f"chunk_{chunk_idx:03d}_altri_raw.wav"
             if not (raw_io.is_file() and raw_others.is_file()):
                 continue
+            total_known = max(
+                1,
+                len(
+                    set(context.recorded_chunks)
+                    | set(context.normalized_chunks)
+                    | set(context.transcribed_chunks)
+                ),
+            )
             runtime.reporter.set_stage(
                 Stage.TRANSCRIBING_FINAL,
                 f"Normalizzazione chunk residuo {chunk_idx + 1}",
+                current=len(context.transcribed_chunks),
+                total=total_known,
             )
             normalize_wav_with_ffmpeg(ffmpeg_path, raw_io, audio_dir / f"chunk_{chunk_idx:03d}_io_16k.wav")
             normalize_wav_with_ffmpeg(
@@ -478,7 +488,24 @@ class SessionProcessor:
         transcriber = self.prepare_job_from_disk(runtime, transcriber)
 
         if transcriber is not None:
-            reporter.set_stage(Stage.TRANSCRIBING_FINAL, "Completamento trascrizione ultimi chunk")
+            ctx_tr = sm.load()
+            done_chunks = len(ctx_tr.transcribed_chunks)
+            total_chunks = max(
+                len(
+                    set(ctx_tr.recorded_chunks)
+                    | set(ctx_tr.normalized_chunks)
+                    | set(ctx_tr.transcribed_chunks)
+                ),
+                len(transcriber.submitted_indices),
+                done_chunks,
+                1,
+            )
+            reporter.set_stage(
+                Stage.TRANSCRIBING_FINAL,
+                "Completamento trascrizione ultimi chunk",
+                current=done_chunks,
+                total=total_chunks,
+            )
             transcriber.drain(self._shutdown_event)
         runtime.recorder = None
         self._check_shutdown()
@@ -520,7 +547,17 @@ class SessionProcessor:
         self._after_first_inference(runtime)
 
         self._check_shutdown()
-        reporter.set_stage(Stage.SUMMARIZING_REDUCE, "Generazione verbale dettagliato e bozza mail")
+        output_settings = runtime.settings.output
+        generate_email = bool(getattr(output_settings, "generate_recap_email", True))
+        total_reduce = 2 if generate_email else 1
+        reporter.set_stage(
+            Stage.SUMMARIZING_REDUCE,
+            "Generazione verbale dettagliato e bozza mail"
+            if generate_email
+            else "Generazione verbale dettagliato",
+            current=1,
+            total=total_reduce,
+        )
         context = sm.load()
         detailed_minutes_path = session_dir / "reduce" / "detailed_minutes.md"
         if not (context.detailed_reduce_completed and detailed_minutes_path.is_file()):
@@ -533,10 +570,15 @@ class SessionProcessor:
                 ended_at=context.ended_at,
             )
 
-        output_settings = runtime.settings.output
         recap_email_path: Path | None = None
-        if getattr(output_settings, "generate_recap_email", True):
+        if generate_email:
             self._check_shutdown()
+            reporter.set_stage(
+                Stage.SUMMARIZING_REDUCE,
+                "Generazione bozza email di recap",
+                current=2,
+                total=total_reduce,
+            )
             recap_email_path = session_dir / "reduce" / "recap_email.md"
             if not (context.email_reduce_completed and recap_email_path.is_file()):
                 recap_email_path = summarizer.run_reduce_email(
@@ -598,6 +640,9 @@ class SessionProcessor:
             status="completed",
             stage=Stage.COMPLETED.value,
             detail=f"Verbale creato: {final_docx_path.name}",
+            progress_current=1,
+            progress_total=1,
+            tokens_generated=None,
             processing_ended_at=now_tz(),
             error=None,
         )

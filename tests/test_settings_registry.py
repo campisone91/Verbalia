@@ -137,7 +137,10 @@ def test_job_registry_jobs_events_commands_and_history(tmp_path: Path) -> None:
     registry.upsert_job("S1", title="Call A", status="processing", call_started_at=started, llm_model="m")
     registry.update_stage("S1", Stage.QUEUED.value, "In coda")
     registry.update_stage("S1", Stage.SUMMARIZING_MAP.value, "MAP 1/2", 1, 2)
+    registry.upsert_job("S1", tokens_generated=350)
     registry.update_stage("S1", Stage.SUMMARIZING_MAP.value, "MAP 2/2", 2, 2)
+    job_mid = registry.get_job("S1")
+    assert job_mid is not None and job_mid["tokens_generated"] is None
     registry.upsert_job("S1", tokens_generated=420)
     job = registry.get_job("S1")
     assert job is not None

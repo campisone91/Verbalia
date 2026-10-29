@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import sys
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import fields
 from datetime import date, timedelta
 from pathlib import Path
@@ -104,16 +104,108 @@ def _elapsed(start: object, end: object = None) -> float | None:
     return max(0.0, (end_dt - start_dt).total_seconds())
 
 
-def describe_progress(job: dict[str, object]) -> str:
-    """Testo di avanzamento del job: MAP 3/6, token generati."""
+def compute_job_progress_percent(job: Mapping[str, object]) -> int | None:
+    """Calcola la percentuale di avanzamento (0..100) dell'elaborazione della transazione."""
+    status = str(job.get("status") or "").strip().lower()
+    stage = str(job.get("stage") or "").strip().lower()
+    if status == "completed" or stage == Stage.COMPLETED.value:
+        return 100
+    if status in ("recording", "paused") or stage in (
+        Stage.RECORDING.value,
+        Stage.RECORDING_AND_TRANSCRIBING.value,
+        Stage.PAUSED.value,
+        Stage.GRACE_PERIOD.value,
+    ):
+        return None
+    if stage == Stage.QUEUED.value or (not stage and status == "queued"):
+        return 0
+    if stage == Stage.FINALIZING_AUDIO.value:
+        return 2
+
+    current = job.get("progress_current")
+    total = job.get("progress_total")
+    tokens = job.get("tokens_generated")
+    has_steps = (
+        isinstance(current, int)
+        and not isinstance(current, bool)
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+        and total > 0
+    )
+    has_tokens = isinstance(tokens, int) and not isinstance(tokens, bool) and tokens > 0
+
+    if stage == Stage.TRANSCRIBING_FINAL.value:
+        if has_steps:
+            assert isinstance(current, int) and isinstance(total, int)
+            frac = min(1.0, max(0.0, current / total))
+            return int(round(5 + 40 * frac))
+        return 10
+
+    if stage == Stage.RELEASING_WHISPER.value:
+        return 45
+
+    if stage == Stage.SUMMARIZING_MAP.value:
+        if has_steps:
+            assert isinstance(current, int) and isinstance(total, int)
+            completed_blocks = max(0, current - 1)
+            in_block = min(0.9, float(tokens) / 600.0) if has_tokens else 0.1
+            frac = min(1.0, max(0.0, (completed_blocks + in_block) / total))
+        else:
+            frac = min(0.9, float(tokens) / 600.0) if has_tokens else 0.1
+        return int(round(45 + 30 * frac))
+
+    if stage == Stage.SUMMARIZING_REDUCE.value:
+        if has_steps:
+            assert isinstance(current, int) and isinstance(total, int)
+            completed_steps = max(0, current - 1)
+            in_step = min(0.9, float(tokens) / 800.0) if has_tokens else 0.1
+            frac = min(1.0, max(0.0, (completed_steps + in_step) / total))
+        else:
+            frac = min(0.9, float(tokens) / 1000.0) if has_tokens else 0.2
+        return int(round(75 + 17 * frac))
+
+    if stage == Stage.BUILDING_DOCX.value:
+        return 94
+    if stage == Stage.VERIFYING_DOCX.value:
+        return 97
+    if stage == Stage.CLEANING_UP.value:
+        return 99
+
+    return None
+
+
+def describe_progress(job: Mapping[str, object]) -> str:
+    """Testo di avanzamento del job: percentuale, MAP/REDUCE/Chunk corrente e token generati."""
     parts: list[str] = []
+    pct = compute_job_progress_percent(job)
+    if pct is not None:
+        parts.append(f"{pct}%")
     current, total = job.get("progress_current"), job.get("progress_total")
     stage = str(job.get("stage") or "")
-    if isinstance(current, int) and isinstance(total, int) and total > 0:
-        prefix = "MAP " if stage == Stage.SUMMARIZING_MAP.value else ""
+    if (
+        isinstance(current, int)
+        and not isinstance(current, bool)
+        and isinstance(total, int)
+        and not isinstance(total, bool)
+        and total > 0
+        and stage != Stage.COMPLETED.value
+        and str(job.get("status") or "") != "completed"
+    ):
+        if stage == Stage.SUMMARIZING_MAP.value:
+            prefix = "MAP "
+        elif stage == Stage.SUMMARIZING_REDUCE.value:
+            prefix = "REDUCE "
+        elif stage in (
+            Stage.TRANSCRIBING_FINAL.value,
+            Stage.RECORDING.value,
+            Stage.RECORDING_AND_TRANSCRIBING.value,
+        ):
+            prefix = "Chunk "
+        else:
+            prefix = ""
         parts.append(f"{prefix}{current}/{total}")
     tokens = job.get("tokens_generated")
-    if isinstance(tokens, int) and tokens > 0:
+    if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens > 0:
         parts.append(f"{tokens} token")
     return " · ".join(parts)
 
@@ -185,6 +277,9 @@ class DashboardApp:
         self._active_jobs: dict[str, dict[str, object]] = {}
         self._history_rows: dict[str, dict[str, object]] = {}
         self._selected_active: str | None = None
+        self._last_history_signature: tuple[int, str, str] | None = None
+        self._last_auto_day: str = date.today().isoformat()
+        self._refresh_after_id: str | None = None
         self._setting_vars: dict[tuple[str, str], Any] = {}
         self._glossary_text: Any = None
         self._model_combo: Any = None
@@ -211,13 +306,14 @@ class DashboardApp:
         self._build_dashboard_tab()
         self._build_history_tab()
         self._build_settings_tab()
+        self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._on_tab_changed())
 
         tabs = {"cruscotto": 0, "storico": 1, "impostazioni": 2}
         if initial_tab in tabs:
             self.notebook.select(tabs[initial_tab])
 
-        self._refresh()
         self._load_history()
+        self._refresh()
 
     # ============================================================ cruscotto
     def _build_dashboard_tab(self) -> None:
@@ -272,7 +368,7 @@ class DashboardApp:
 
         columns = ("title", "start", "status", "stage", "progress", "in_stage", "total")
         headings = ("Titolo", "Inizio", "Stato", "Fase", "Avanzamento", "Tempo in fase", "Tempo totale")
-        widths = (300, 110, 170, 210, 140, 100, 100)
+        widths = (275, 110, 170, 210, 165, 100, 100)
         self.active_tree = ttk.Treeview(frame, columns=columns, show="headings", height=8, selectmode="browse")
         for col, heading, width in zip(columns, headings, widths, strict=True):
             self.active_tree.heading(col, text=heading)
@@ -305,6 +401,20 @@ class DashboardApp:
             ttk.Label(steps, textvariable=var, style="Step.TLabel").grid(row=0, column=index * 2, padx=2)
             if index < len(PIPELINE_STEPS) - 1:
                 ttk.Label(steps, text="→").grid(row=0, column=index * 2 + 1)
+        progress_frame = ttk.Frame(detail)
+        progress_frame.pack(fill="x", pady=(6, 2))
+        self.progress_bar = ttk.Progressbar(
+            progress_frame,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100,
+            length=260,
+        )
+        self.progress_bar.pack(side="left", padx=(0, 10))
+        self.var_progress_pct = tk.StringVar(value="Avanzamento elaborazione: -")
+        ttk.Label(progress_frame, textvariable=self.var_progress_pct, style="Status.TLabel").pack(
+            side="left", anchor="w"
+        )
         self.var_error = tk.StringVar(value="")
         ttk.Label(detail, textvariable=self.var_error, style="Warn.TLabel", wraplength=1050).pack(
             fill="x", pady=(6, 2)
@@ -578,10 +688,38 @@ class DashboardApp:
             self._refresh_status()
             self._refresh_active_jobs()
             self._refresh_detail()
+            self._refresh_history_if_changed()
         except Exception as exc:
             logger.debug("Aggiornamento del cruscotto non riuscito: %s", exc)
         finally:
-            self.root.after(REFRESH_INTERVAL_MS, self._refresh)
+            if self._refresh_after_id is not None:
+                try:
+                    self.root.after_cancel(self._refresh_after_id)
+                except Exception:
+                    pass
+            try:
+                self._refresh_after_id = self.root.after(REFRESH_INTERVAL_MS, self._refresh)
+            except Exception:
+                self._refresh_after_id = None
+
+    def _on_tab_changed(self) -> None:
+        try:
+            if self.notebook.index(self.notebook.select()) == 1:
+                self._load_history()
+        except Exception as exc:
+            logger.debug("Aggiornamento al cambio scheda non riuscito: %s", exc)
+
+    def _refresh_history_if_changed(self) -> None:
+        today_iso = date.today().isoformat()
+        day_shifted = False
+        if today_iso != self._last_auto_day:
+            if hasattr(self, "var_day") and self.var_day.get().strip() == self._last_auto_day:
+                self.var_day.set(today_iso)
+                day_shifted = True
+            self._last_auto_day = today_iso
+        sig = self.registry.jobs_signature()
+        if day_shifted or sig != self._last_history_signature:
+            self._load_history()
 
     def _refresh_status(self) -> None:
         status = self.registry.get_status()
@@ -656,12 +794,35 @@ class DashboardApp:
         if job is None:
             for index, name in enumerate(PIPELINE_STEPS):
                 self.step_vars[index].set(f"○ {name}")
+            if hasattr(self, "progress_bar"):
+                self.progress_bar["value"] = 0
+            if hasattr(self, "var_progress_pct"):
+                self.var_progress_pct.set("Avanzamento elaborazione: -")
             self.var_error.set("Nessuna sessione attiva.")
             self.events_list.delete(0, "end")
             return
         marks = pipeline_marks(str(job.get("stage") or ""), str(job.get("status") or ""))
         for index, name in enumerate(PIPELINE_STEPS):
             self.step_vars[index].set(f"{marks[index]} {name}")
+        pct = compute_job_progress_percent(job)
+        prog_text = describe_progress(job)
+        if hasattr(self, "progress_bar"):
+            self.progress_bar["value"] = pct if pct is not None else 0
+        if hasattr(self, "var_progress_pct"):
+            if pct is not None:
+                detail_str = str(job.get("detail") or "").strip()
+                suffix = f" — {detail_str}" if detail_str else ""
+                self.var_progress_pct.set(f"Avanzamento elaborazione: {prog_text}{suffix}")
+            elif str(job.get("status") or "") in ("recording", "paused") or str(job.get("stage") or "") in (
+                Stage.RECORDING.value,
+                Stage.RECORDING_AND_TRANSCRIBING.value,
+                Stage.PAUSED.value,
+                Stage.GRACE_PERIOD.value,
+            ):
+                extra = f" ({prog_text})" if prog_text else ""
+                self.var_progress_pct.set(f"Avanzamento elaborazione: in attesa di fine registrazione{extra}")
+            else:
+                self.var_progress_pct.set(f"Avanzamento elaborazione: {prog_text or '-'}")
         error = job.get("error")
         retry_at = parse_iso(job.get("next_retry_at"))
         message = f"Errore: {error}" if error else ""
@@ -695,24 +856,32 @@ class DashboardApp:
 
         ttk.Label(filters, text="Giorno").grid(row=0, column=0, sticky="w")
         ttk.Button(filters, text="◀", width=3, command=lambda: self._shift_day(-1)).grid(row=0, column=1)
-        ttk.Entry(filters, textvariable=self.var_day, width=11).grid(row=0, column=2)
+        day_entry = ttk.Entry(filters, textvariable=self.var_day, width=11)
+        day_entry.grid(row=0, column=2)
+        day_entry.bind("<Return>", lambda _e: self._load_history())
         ttk.Button(filters, text="▶", width=3, command=lambda: self._shift_day(1)).grid(row=0, column=3)
         ttk.Button(filters, text="Oggi", command=self._today).grid(row=0, column=4, padx=(4, 12))
         ttk.Checkbutton(filters, text="Tutti i giorni", variable=self.var_all_days, command=self._load_history).grid(
             row=0, column=5, padx=(0, 12)
         )
         ttk.Label(filters, text="Dal").grid(row=0, column=6)
-        ttk.Entry(filters, textvariable=self.var_from, width=11).grid(row=0, column=7, padx=2)
+        from_entry = ttk.Entry(filters, textvariable=self.var_from, width=11)
+        from_entry.grid(row=0, column=7, padx=2)
+        from_entry.bind("<Return>", lambda _e: self._load_history())
         ttk.Label(filters, text="Al").grid(row=0, column=8)
-        ttk.Entry(filters, textvariable=self.var_to, width=11).grid(row=0, column=9, padx=(2, 12))
+        to_entry = ttk.Entry(filters, textvariable=self.var_to, width=11)
+        to_entry.grid(row=0, column=9, padx=(2, 12))
+        to_entry.bind("<Return>", lambda _e: self._load_history())
         ttk.Label(filters, text="Esito").grid(row=0, column=10)
-        ttk.Combobox(
+        status_combo = ttk.Combobox(
             filters,
             textvariable=self.var_status,
             values=[label for label, _ in HISTORY_STATUS_FILTERS],
             state="readonly",
             width=20,
-        ).grid(row=0, column=11, padx=(2, 12))
+        )
+        status_combo.grid(row=0, column=11, padx=(2, 12))
+        status_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_history())
         ttk.Label(filters, text="Testo").grid(row=0, column=12)
         text_entry = ttk.Entry(filters, textvariable=self.var_text, width=18)
         text_entry.grid(row=0, column=13, padx=2)
@@ -787,9 +956,11 @@ class DashboardApp:
                 status=status_value,
                 text=self.var_text.get().strip() or None,
             )
+            self._last_history_signature = self.registry.jobs_signature()
         except Exception as exc:
             self._error("Storico non disponibile", str(exc))
             return
+        prev_selected = self._selected_history_id()
         tree = self.history_tree
         tree.delete(*tree.get_children())
         if hasattr(self, "btn_hist_delete"):
@@ -828,6 +999,10 @@ class DashboardApp:
                         Path(str(docx_path)).name if docx_path else "-",
                     ),
                 )
+        if prev_selected and prev_selected in self._history_rows and tree.exists(prev_selected):
+            tree.selection_set(prev_selected)
+            tree.see(prev_selected)
+            self._on_history_select()
 
     def _selected_history_id(self) -> str | None:
         selection = self.history_tree.selection()

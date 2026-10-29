@@ -243,7 +243,10 @@ class JobRegistry:
         """Aggiorna stage e avanzamento; registra un evento solo quando lo stage cambia."""
         at = _iso(occurred_at or now_tz())
         with self._write_lock, self._connect() as conn:
-            row = conn.execute("SELECT stage FROM jobs WHERE session_id=?", (session_id,)).fetchone()
+            row = conn.execute(
+                "SELECT stage, progress_current FROM jobs WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
             if row is None:
                 conn.execute(
                     "INSERT INTO jobs (session_id, status, stage, detail, progress_current, progress_total,"
@@ -253,11 +256,18 @@ class JobRegistry:
                 changed = True
             else:
                 changed = row["stage"] != stage
+                step_changed = current != row["progress_current"]
                 if changed:
                     conn.execute(
                         "UPDATE jobs SET stage=?, detail=?, progress_current=?, progress_total=?,"
                         " tokens_generated=NULL, stage_started_at=?, updated_at=? WHERE session_id=?",
                         (stage, detail, current, total, at, at, session_id),
+                    )
+                elif step_changed:
+                    conn.execute(
+                        "UPDATE jobs SET detail=?, progress_current=?, progress_total=?,"
+                        " tokens_generated=NULL, updated_at=? WHERE session_id=?",
+                        (detail, current, total, at, session_id),
                     )
                 else:
                     conn.execute(
@@ -286,17 +296,36 @@ class JobRegistry:
             return dict(row) if row is not None else None
 
     def list_active_jobs(self) -> list[dict[str, object]]:
-        """Job non conclusi (registrazione, coda, elaborazione, errore) più i completati di recente."""
-        recent_limit = _iso(now_tz() - timedelta(minutes=30))
+        """Job non conclusi (registrazione, coda, elaborazione, errore) più i completati di oggi o degli ultimi 30 min."""
+        now = now_tz()
+        recent_limit = _iso(now - timedelta(minutes=30))
+        today_str = now.strftime("%Y-%m-%d")
         placeholders = ", ".join("?" for _ in ACTIVE_JOB_STATUSES)
         with self._connect() as conn:
             rows = conn.execute(
                 f"SELECT * FROM jobs WHERE status IN ({placeholders})"
-                " OR (status=? AND COALESCE(processing_ended_at, updated_at) >= ?)"
+                " OR (status=? AND ("
+                "   COALESCE(processing_ended_at, updated_at) >= ?"
+                "   OR substr(COALESCE(call_started_at, processing_ended_at, created_at), 1, 10) = ?"
+                " ))"
                 " ORDER BY COALESCE(call_started_at, created_at)",
-                (*ACTIVE_JOB_STATUSES, JOB_COMPLETED, recent_limit),
+                (*ACTIVE_JOB_STATUSES, JOB_COMPLETED, recent_limit, today_str),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def jobs_signature(self) -> tuple[int, str, str]:
+        """Firma leggera dello stato della tabella jobs per rilevare variazioni da sincronizzare nella GUI."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS cnt, COALESCE(MAX(updated_at), '') AS max_upd,"
+                " COALESCE(GROUP_CONCAT("
+                "   session_id || ':' || status || ':' || COALESCE(stage, '') || ':' || COALESCE(title, '') || ':' || COALESCE(docx_path, ''), '|'"
+                " ), '') AS summary"
+                " FROM (SELECT session_id, status, stage, title, docx_path, updated_at FROM jobs ORDER BY session_id LIMIT 200)"
+            ).fetchone()
+            if row is None:
+                return (0, "", "")
+            return (int(row["cnt"]), str(row["max_upd"]), str(row["summary"]))
 
     def list_history(
         self,

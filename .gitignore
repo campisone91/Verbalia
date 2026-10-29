@@ -85,3 +85,8 @@ models/
 # Windows
 Thumbs.db
 Desktop.ini
+
+
+# Roadmap e appunti interni di progetto (esclusi da GitHub)
+ROADMAP_EVOLUTIVE.md
+ROADMAP_*.md

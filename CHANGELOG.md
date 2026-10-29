@@ -5,6 +5,14 @@ Tutte le modifiche rilevanti a questo progetto sono documentate in questo file.
 Il formato è basato su [Keep a Changelog](https://keepachangelog.com/it/1.1.0/),
 e questo progetto aderisce al [Semantic Versioning](https://semver.org/lang/it/).
 
+## [1.0.2] - 2026-10-29
+
+### Added
+- Percentuale di avanzamento dell'elaborazione (`0% - 100%`) e barra di progresso grafica nel Cruscotto, con tracciamento fine dei chunk trascritti e dei passi REDUCE.
+
+### Fixed
+- Sincronizzazione automatica in tempo reale tra Cruscotto e scheda Storico al cambio di stato delle sessioni e mantenimento delle call completate in giornata nel Cruscotto.
+
 ## [1.0.1] - 2026-10-28
 
 ### Added

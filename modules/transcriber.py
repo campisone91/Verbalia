@@ -711,10 +711,19 @@ class RollingTranscriber:
         if self._state_manager is None:
             return
 
+        counts: list[int] = [0, 0]
+
         def _apply(ctx: SessionContext) -> None:
             if chunk_index not in ctx.transcribed_chunks:
                 ctx.transcribed_chunks.append(chunk_index)
                 ctx.transcribed_chunks.sort()
+            all_known = (
+                set(ctx.recorded_chunks)
+                | set(ctx.normalized_chunks)
+                | set(ctx.transcribed_chunks)
+            )
+            counts[0] = len(ctx.transcribed_chunks)
+            counts[1] = max(len(all_known), counts[0])
 
         mutate_fn = getattr(self._state_manager, "mutate", None)
         if callable(mutate_fn):
@@ -723,6 +732,15 @@ class RollingTranscriber:
             ctx = self._state_manager.load()
             _apply(ctx)
             self._state_manager.save(ctx)
+
+        progress_fn = getattr(self._stage_reporter, "progress_steps", None)
+        if callable(progress_fn) and counts[1] > 0:
+            with self._pending_cond:
+                total_known = max(counts[1], len(self._submitted))
+            try:
+                progress_fn(counts[0], total_known)
+            except Exception as exc:
+                logger.debug("Aggiornamento progress_steps trascrizione non riuscito: %s", exc)
 
     def _update_state_audio_deleted(self, chunk_index: int) -> None:
         """Registra l'avvenuta cancellazione dei WAV 16k del chunk nello StateManager."""
