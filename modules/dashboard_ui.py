@@ -1,21 +1,34 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
 from collections.abc import Callable, Mapping
 from dataclasses import fields
+from dataclasses import replace as _dc_replace
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any
 
-from config import APP_ICON_PATH, APP_NAME, APP_VERSION, EXIT_MISSING_DEPENDENCY, EXIT_SUCCESS
-from modules.contracts import Stage, UiCommandType, now_tz
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import Qt, QTimer, Signal
+
+from config import (
+    APP_ICON_PATH,
+    APP_NAME,
+    APP_VERSION,
+    EXIT_MISSING_DEPENDENCY,
+    EXIT_SUCCESS,
+    PROJECT_ROOT,
+)
+from modules.contracts import STAGE_LABELS_IT, Stage, UiCommandType, now_tz
 from modules.job_registry import JOB_STATUS_LABELS_IT, JobRegistry, parse_iso
 from modules.logging_setup import get_logger
 from modules.settings import (
     SETTINGS_GROUP_LABELS,
     AppSettings,
+    apply_to_config,
     default_settings,
     load_settings,
     resolve_output_dir,
@@ -25,7 +38,16 @@ from modules.settings import (
     settings_to_dict,
 )
 from modules.single_instance import DASHBOARD_MUTEX_NAME, SingleInstance, focus_window_by_title
-from modules.tray_ui import STAGE_LABELS_IT
+from modules.updater import (
+    UpdateInfo,
+    UpdateResult,
+    check_for_updates,
+    download_and_apply_update,
+    extract_changelog_section,
+    is_newer_version,
+    spawn_restarted_processes,
+    stop_background_instance,
+)
 
 logger = get_logger("dashboard")
 
@@ -71,6 +93,9 @@ HISTORY_STATUS_FILTERS: tuple[tuple[str, str | None], ...] = (
 )
 
 
+# ==============================================================================
+# Funzioni pure di formattazione e calcolo avanzamento
+# ==============================================================================
 def _stage_label(stage: object) -> str:
     if isinstance(stage, str):
         if stage.lower() == "paused":
@@ -132,7 +157,7 @@ def compute_job_progress_percent(job: Mapping[str, object]) -> int | None:
         and not isinstance(total, bool)
         and total > 0
     )
-    has_tokens = isinstance(tokens, int) and not isinstance(tokens, bool) and tokens > 0
+    tokens_val = tokens if isinstance(tokens, int) and not isinstance(tokens, bool) and tokens > 0 else 0
 
     if stage == Stage.TRANSCRIBING_FINAL.value:
         if has_steps:
@@ -148,20 +173,20 @@ def compute_job_progress_percent(job: Mapping[str, object]) -> int | None:
         if has_steps:
             assert isinstance(current, int) and isinstance(total, int)
             completed_blocks = max(0, current - 1)
-            in_block = min(0.9, float(tokens) / 600.0) if has_tokens else 0.1
+            in_block = min(0.9, float(tokens_val) / 600.0) if tokens_val > 0 else 0.1
             frac = min(1.0, max(0.0, (completed_blocks + in_block) / total))
         else:
-            frac = min(0.9, float(tokens) / 600.0) if has_tokens else 0.1
+            frac = min(0.9, float(tokens_val) / 600.0) if tokens_val > 0 else 0.1
         return int(round(45 + 30 * frac))
 
     if stage == Stage.SUMMARIZING_REDUCE.value:
         if has_steps:
             assert isinstance(current, int) and isinstance(total, int)
             completed_steps = max(0, current - 1)
-            in_step = min(0.9, float(tokens) / 800.0) if has_tokens else 0.1
+            in_step = min(0.9, float(tokens_val) / 800.0) if tokens_val > 0 else 0.1
             frac = min(1.0, max(0.0, (completed_steps + in_step) / total))
         else:
-            frac = min(0.9, float(tokens) / 1000.0) if has_tokens else 0.2
+            frac = min(0.9, float(tokens_val) / 1000.0) if tokens_val > 0 else 0.2
         return int(round(75 + 17 * frac))
 
     if stage == Stage.BUILDING_DOCX.value:
@@ -238,25 +263,857 @@ def _open_path(path: Path) -> bool:
         return False
 
 
-def _run_in_background(root: Any, work: Callable[[], object], done: Callable[[object], None]) -> None:
-    """Esegue work fuori dal thread Tk e consegna il risultato con root.after."""
+# ==============================================================================
+# Fogli di stile QSS Windows 11 Fluent (Light & Dark)
+# ==============================================================================
+FLUENT_LIGHT_QSS = """
+QMainWindow, QDialog {
+    background-color: #F3F4F6;
+    color: #0F172A;
+    font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+    font-size: 11px;
+}
+QWidget {
+    color: #0F172A;
+    font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+    font-size: 11px;
+}
+QGroupBox {
+    background-color: #FFFFFF;
+    border: 1px solid #E2E8F0;
+    border-radius: 6px;
+    margin-top: 17px;
+    padding: 8px 8px 6px 8px;
+    font-weight: 600;
+    color: #1E293B;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 6px;
+    top: 1px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    color: #2563EB;
+    background-color: transparent;
+}
+QTabWidget::pane {
+    background-color: #F8FAFC;
+    border: 1px solid #E2E8F0;
+    border-radius: 6px;
+    top: -1px;
+}
+QTabBar::tab {
+    background-color: transparent;
+    color: #475569;
+    padding: 5px 14px;
+    margin-right: 3px;
+    border-top-left-radius: 5px;
+    border-top-right-radius: 5px;
+    font-weight: 600;
+    border-bottom: 2px solid transparent;
+}
+QTabBar::tab:hover {
+    background-color: #E2E8F0;
+    color: #0F172A;
+}
+QTabBar::tab:selected {
+    background-color: #FFFFFF;
+    color: #2563EB;
+    border: 1px solid #E2E8F0;
+    border-bottom: 2px solid #2563EB;
+}
+QPushButton {
+    background-color: #FFFFFF;
+    color: #1E293B;
+    border: 1px solid #CBD5E1;
+    border-radius: 5px;
+    padding: 3px 9px;
+    font-weight: 500;
+}
+QPushButton:hover {
+    background-color: #F1F5F9;
+    border-color: #94A3B8;
+}
+QPushButton:pressed {
+    background-color: #E2E8F0;
+}
+QPushButton:disabled {
+    background-color: #F8FAFC;
+    color: #94A3B8;
+    border-color: #E2E8F0;
+}
+QPushButton[btnRole="primary"] {
+    background-color: #2563EB;
+    color: #FFFFFF;
+    border: 1px solid #1D4ED8;
+    font-weight: 600;
+}
+QPushButton[btnRole="primary"]:hover {
+    background-color: #1D4ED8;
+}
+QPushButton[btnRole="primary"]:disabled {
+    background-color: #93C5FD;
+    color: #EFF6FF;
+    border-color: #93C5FD;
+}
+QPushButton[btnRole="danger"] {
+    background-color: #FFFFFF;
+    color: #DC2626;
+    border: 1px solid #FCA5A5;
+}
+QPushButton[btnRole="danger"]:hover {
+    background-color: #FEF2F2;
+    border-color: #EF4444;
+}
+QPushButton[btnRole="danger"]:disabled {
+    background-color: #F8FAFC;
+    color: #CBD5E1;
+    border-color: #E2E8F0;
+}
+QTreeWidget, QListWidget {
+    background-color: #FFFFFF;
+    alternate-background-color: #F8FAFC;
+    border: 1px solid #CBD5E1;
+    border-radius: 5px;
+    outline: none;
+    selection-background-color: #DBEAFE;
+    selection-color: #1E3A8A;
+}
+QTreeWidget::item, QListWidget::item {
+    padding: 2px 4px;
+    border-bottom: 1px solid #F1F5F9;
+}
+QListWidget#eventsList {
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 10px;
+}
+QListWidget#eventsList::item {
+    padding: 1px 4px;
+    border-bottom: none;
+}
+QTreeWidget::item:selected, QListWidget::item:selected {
+    background-color: #DBEAFE;
+    color: #1E3A8A;
+}
+QHeaderView::section {
+    background-color: #F1F5F9;
+    color: #334155;
+    font-weight: 600;
+    padding: 4px 6px;
+    border: none;
+    border-right: 1px solid #E2E8F0;
+    border-bottom: 1px solid #CBD5E1;
+}
+QLineEdit, QComboBox, QPlainTextEdit {
+    background-color: #FFFFFF;
+    color: #0F172A;
+    border: 1px solid #CBD5E1;
+    border-radius: 5px;
+    padding: 3px 6px;
+    selection-background-color: #2563EB;
+    selection-color: #FFFFFF;
+}
+QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus {
+    border: 1px solid #2563EB;
+}
+QProgressBar {
+    background-color: #E2E8F0;
+    border: none;
+    border-radius: 4px;
+    height: 8px;
+    text-align: center;
+    color: transparent;
+}
+QProgressBar::chunk {
+    background-color: #2563EB;
+    border-radius: 4px;
+}
+QScrollArea, QWidget#settingsViewport, QWidget#settingsScrollContent {
+    border: none;
+    background-color: #F8FAFC;
+}
+QSplitter::handle:vertical {
+    background-color: #E2E8F0;
+    height: 5px;
+    margin: 2px 40px;
+    border-radius: 2px;
+}
+QSplitter::handle:vertical:hover {
+    background-color: #2563EB;
+}
+QLabel[labelRole="warn"] {
+    color: #B45309;
+    font-weight: 600;
+}
+QLabel[labelRole="help"] {
+    color: #64748B;
+    font-size: 10.5px;
+}
+QLabel[labelRole="step"] {
+    background-color: #F1F5F9;
+    border: 1px solid #E2E8F0;
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 10.5px;
+    font-weight: 500;
+}
+QLabel[labelRole="version"] {
+    background-color: #EFF6FF;
+    color: #1D4ED8;
+    border: 1px solid #BFDBFE;
+    border-radius: 4px;
+    padding: 1px 7px;
+    font-weight: 600;
+}
+QFrame#updateBanner {
+    background-color: #EFF6FF;
+    border: 1px solid #93C5FD;
+    border-radius: 6px;
+    padding: 4px 8px;
+}
+QLabel[labelRole="updateTitle"] {
+    color: #1E3A8A;
+    font-weight: 600;
+}
+QMenu {
+    background-color: #FFFFFF;
+    color: #0F172A;
+    border: 1px solid #CBD5E1;
+    border-radius: 6px;
+    padding: 3px;
+}
+QMenu::item {
+    padding: 4px 16px;
+    border-radius: 4px;
+}
+QMenu::item:selected {
+    background-color: #DBEAFE;
+    color: #1E3A8A;
+}
+"""
+
+FLUENT_DARK_QSS = """
+QMainWindow, QDialog {
+    background-color: #0F172A;
+    color: #F8FAFC;
+    font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+    font-size: 11px;
+}
+QWidget {
+    color: #F8FAFC;
+    font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif;
+    font-size: 11px;
+}
+QGroupBox {
+    background-color: #1E293B;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    margin-top: 17px;
+    padding: 8px 8px 6px 8px;
+    font-weight: 600;
+    color: #F1F5F9;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    subcontrol-position: top left;
+    left: 6px;
+    top: 1px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    color: #60A5FA;
+    background-color: transparent;
+}
+QTabWidget::pane {
+    background-color: #0F172A;
+    border: 1px solid #334155;
+    border-radius: 6px;
+    top: -1px;
+}
+QTabBar::tab {
+    background-color: transparent;
+    color: #94A3B8;
+    padding: 5px 14px;
+    margin-right: 3px;
+    border-top-left-radius: 5px;
+    border-top-right-radius: 5px;
+    font-weight: 600;
+    border-bottom: 2px solid transparent;
+}
+QTabBar::tab:hover {
+    background-color: #1E293B;
+    color: #F8FAFC;
+}
+QTabBar::tab:selected {
+    background-color: #1E293B;
+    color: #60A5FA;
+    border: 1px solid #334155;
+    border-bottom: 2px solid #3B82F6;
+}
+QPushButton {
+    background-color: #1E293B;
+    color: #F1F5F9;
+    border: 1px solid #475569;
+    border-radius: 5px;
+    padding: 3px 9px;
+    font-weight: 500;
+}
+QPushButton:hover {
+    background-color: #334155;
+    border-color: #64748B;
+}
+QPushButton:pressed {
+    background-color: #0F172A;
+}
+QPushButton:disabled {
+    background-color: #0F172A;
+    color: #475569;
+    border-color: #1E293B;
+}
+QPushButton[btnRole="primary"] {
+    background-color: #2563EB;
+    color: #FFFFFF;
+    border: 1px solid #3B82F6;
+    font-weight: 600;
+}
+QPushButton[btnRole="primary"]:hover {
+    background-color: #3B82F6;
+}
+QPushButton[btnRole="primary"]:disabled {
+    background-color: #1E3A8A;
+    color: #64748B;
+    border-color: #1E3A8A;
+}
+QPushButton[btnRole="danger"] {
+    background-color: #1E293B;
+    color: #F87171;
+    border: 1px solid #7F1D1D;
+}
+QPushButton[btnRole="danger"]:hover {
+    background-color: #450A0A;
+    border-color: #EF4444;
+}
+QPushButton[btnRole="danger"]:disabled {
+    background-color: #0F172A;
+    color: #475569;
+    border-color: #1E293B;
+}
+QTreeWidget, QListWidget {
+    background-color: #1E293B;
+    alternate-background-color: #172033;
+    border: 1px solid #334155;
+    border-radius: 5px;
+    outline: none;
+    selection-background-color: #1E3A8A;
+    selection-color: #EFF6FF;
+}
+QTreeWidget::item, QListWidget::item {
+    padding: 2px 4px;
+    border-bottom: 1px solid #1E293B;
+}
+QListWidget#eventsList {
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 10px;
+}
+QListWidget#eventsList::item {
+    padding: 1px 4px;
+    border-bottom: none;
+}
+QTreeWidget::item:selected, QListWidget::item:selected {
+    background-color: #1E3A8A;
+    color: #EFF6FF;
+}
+QHeaderView::section {
+    background-color: #0F172A;
+    color: #CBD5E1;
+    font-weight: 600;
+    padding: 4px 6px;
+    border: none;
+    border-right: 1px solid #1E293B;
+    border-bottom: 1px solid #334155;
+}
+QLineEdit, QComboBox, QPlainTextEdit {
+    background-color: #0F172A;
+    color: #F8FAFC;
+    border: 1px solid #475569;
+    border-radius: 5px;
+    padding: 3px 6px;
+    selection-background-color: #3B82F6;
+    selection-color: #FFFFFF;
+}
+QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus {
+    border: 1px solid #60A5FA;
+}
+QProgressBar {
+    background-color: #334155;
+    border: none;
+    border-radius: 4px;
+    height: 8px;
+    text-align: center;
+    color: transparent;
+}
+QProgressBar::chunk {
+    background-color: #3B82F6;
+    border-radius: 4px;
+}
+QScrollArea, QWidget#settingsViewport, QWidget#settingsScrollContent {
+    border: none;
+    background-color: #0F172A;
+}
+QSplitter::handle:vertical {
+    background-color: #334155;
+    height: 5px;
+    margin: 2px 40px;
+    border-radius: 2px;
+}
+QSplitter::handle:vertical:hover {
+    background-color: #60A5FA;
+}
+QLabel[labelRole="warn"] {
+    color: #FBBF24;
+    font-weight: 600;
+}
+QLabel[labelRole="help"] {
+    color: #94A3B8;
+    font-size: 10.5px;
+}
+QLabel[labelRole="step"] {
+    background-color: #0F172A;
+    border: 1px solid #334155;
+    border-radius: 4px;
+    padding: 2px 6px;
+    font-size: 10.5px;
+    font-weight: 500;
+}
+QLabel[labelRole="version"] {
+    background-color: #1E3A8A;
+    color: #93C5FD;
+    border: 1px solid #3B82F6;
+    border-radius: 4px;
+    padding: 1px 7px;
+    font-weight: 600;
+}
+QFrame#updateBanner {
+    background-color: #1E293B;
+    border: 1px solid #3B82F6;
+    border-radius: 6px;
+    padding: 4px 8px;
+}
+QLabel[labelRole="updateTitle"] {
+    color: #93C5FD;
+    font-weight: 600;
+}
+QMenu {
+    background-color: #1E293B;
+    color: #F8FAFC;
+    border: 1px solid #475569;
+    border-radius: 6px;
+    padding: 3px;
+}
+QMenu::item {
+    padding: 4px 16px;
+    border-radius: 4px;
+}
+QMenu::item:selected {
+    background-color: #1E3A8A;
+    color: #EFF6FF;
+}
+"""
+
+
+# ==============================================================================
+# Wrapper e Componenti Qt con API compatibile per Binding Reattivi e Test
+# ==============================================================================
+class _BackgroundBridge(QtCore.QObject):
+    """Consegna in modo thread-safe i risultati dei thread di background sul main thread Qt."""
+
+    completed = Signal(object, object)
+    progress = Signal(object, int, str)
+
+    def __init__(self, parent: QtCore.QObject | None = None) -> None:
+        super().__init__(parent)
+        self.completed.connect(self._on_completed)
+        self.progress.connect(self._on_progress)
+
+    @staticmethod
+    def _on_completed(done_cb: object, result: object) -> None:
+        if callable(done_cb):
+            try:
+                done_cb(result)
+            except RuntimeError:
+                pass
+
+    @staticmethod
+    def _on_progress(prog_cb: object, pct: int, msg: str) -> None:
+        if callable(prog_cb):
+            try:
+                prog_cb(pct, msg)
+            except RuntimeError:
+                pass
+
+
+def _run_in_background(owner: Any, work: Callable[[], object], done: Callable[[object], None]) -> None:
+    """Esegue work fuori dal thread UI e consegna il risultato nel thread principale."""
+    bridge = getattr(owner, "_bg_bridge", None)
 
     def _target() -> None:
         try:
             result: object = work()
-        except Exception as exc:  # pragma: no cover - mostrato all'utente
+        except Exception as exc:  # pragma: no cover
             result = exc
-        try:
-            root.after(0, lambda: done(result))
-        except RuntimeError:
-            # Finestra già chiusa: il risultato non serve più
-            pass
+        if isinstance(bridge, _BackgroundBridge):
+            try:
+                bridge.completed.emit(done, result)
+            except RuntimeError:
+                pass
+        elif hasattr(owner, "after"):
+            try:
+                owner.after(0, lambda: done(result))
+            except Exception:
+                pass
 
     threading.Thread(target=_target, daemon=True).start()
 
 
-class DashboardApp:
-    """Finestra del cruscotto: legge SQLite ogni secondo, scrive settings.json e i comandi per l'app."""
+class _ReactiveVar:
+    """Variabile reattiva leggera sincronizzata con uno o più widget Qt (QLabel, QLineEdit, QComboBox, QCheckBox)."""
+
+    def __init__(self, value: Any = "") -> None:
+        self._value: Any = value
+        self._listeners: list[Callable[[Any], None]] = []
+        self._getter: Callable[[], Any] | None = None
+
+    def bind_Label(self, label: QtWidgets.QLabel) -> QtWidgets.QLabel:
+        label.setText(str(self._value))
+        self._listeners.append(lambda v: label.setText(str(v)))
+        return label
+
+    def bind_LineEdit(self, edit: QtWidgets.QLineEdit) -> QtWidgets.QLineEdit:
+        edit.setText(str(self._value))
+        self._listeners.append(lambda v: edit.setText(str(v)) if edit.text() != str(v) else None)
+        edit.textChanged.connect(self._on_widget_changed)
+        self._getter = edit.text
+        return edit
+
+    def bind_ComboBox(self, combo: QtWidgets.QComboBox) -> QtWidgets.QComboBox:
+        text = str(self._value)
+        idx = combo.findText(text)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+        else:
+            combo.setEditText(text)
+
+        def _apply(v: Any) -> None:
+            s = str(v)
+            i = combo.findText(s)
+            if i >= 0:
+                combo.setCurrentIndex(i)
+            elif combo.isEditable():
+                combo.setEditText(s)
+
+        self._listeners.append(_apply)
+        combo.currentTextChanged.connect(self._on_widget_changed)
+        self._getter = combo.currentText
+        return combo
+
+    def bind_CheckBox(self, chk: QtWidgets.QCheckBox) -> QtWidgets.QCheckBox:
+        chk.setChecked(bool(self._value))
+        self._listeners.append(lambda v: chk.setChecked(bool(v)) if chk.isChecked() != bool(v) else None)
+        chk.toggled.connect(self._on_widget_changed)
+        self._getter = chk.isChecked
+        return chk
+
+    def _on_widget_changed(self, new_val: Any) -> None:
+        self._value = new_val
+
+    def get(self) -> Any:
+        if self._getter is not None:
+            try:
+                return self._getter()
+            except RuntimeError:
+                return self._value
+        return self._value
+
+    def set(self, value: Any) -> None:
+        self._value = value
+        for listener in list(self._listeners):
+            try:
+                listener(value)
+            except RuntimeError:
+                pass
+
+
+class _FluentButton(QtWidgets.QPushButton):
+    """QPushButton con metodi di comodità compatibili con i test esistenti (state, config, cget)
+    e protezione anti-taglio del testo su qualsiasi larghezza finestra."""
+
+    def __init__(self, text: str = "", parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(text, parent)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Minimum,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+
+    def _computed_size(self) -> QtCore.QSize:
+        base = super().sizeHint()
+        fm = self.fontMetrics()
+        text_width = fm.horizontalAdvance(self.text() or "")
+        # Margine compatto per emoji Unicode DirectWrite + padding QSS
+        width = max(base.width(), text_width + 32, 30)
+        height = max(base.height(), 26)
+        return QtCore.QSize(width, height)
+
+    def sizeHint(self) -> QtCore.QSize:  # noqa: N802
+        return self._computed_size()
+
+    def minimumSizeHint(self) -> QtCore.QSize:  # noqa: N802
+        return self._computed_size()
+
+    def setText(self, text: str) -> None:  # noqa: N802
+        super().setText(text)
+        self.updateGeometry()
+
+    def state(self, states: list[str] | tuple[str, ...] | None = None) -> tuple[str, ...]:
+        if states is not None:
+            for st in states:
+                if st == "disabled":
+                    self.setEnabled(False)
+                elif st == "!disabled":
+                    self.setEnabled(True)
+        return () if self.isEnabled() else ("disabled",)
+
+    def config(self, **kwargs: Any) -> None:
+        if "text" in kwargs:
+            self.setText(str(kwargs["text"]))
+
+    configure = config
+
+    def cget(self, key: str) -> Any:
+        if key == "text":
+            return self.text()
+        return getattr(self, key, None)
+
+
+class _FluentProgressBar(QtWidgets.QProgressBar):
+    """QProgressBar con accesso indicizzato `bar['value']` oltre a `.value()` / `.setValue()`."""
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "value":
+            return self.value()
+        raise KeyError(key)
+
+    def __setitem__(self, key: str, val: Any) -> None:
+        if key == "value":
+            self.setValue(int(val or 0))
+        else:
+            raise KeyError(key)
+
+
+class _FluentEventsList(QtWidgets.QListWidget):
+    """QListWidget con metodi rapidi `delete(0, 'end')` e `insert('end', text)`."""
+
+    def delete(self, _start: int | str, _end: str | None = None) -> None:
+        self.clear()
+
+    def insert(self, _pos: str | int, text: str) -> None:
+        self.addItem(str(text))
+
+
+class _FluentTreeWidget(QtWidgets.QTreeWidget):
+    """QTreeWidget ad alte prestazioni con indicizzazione O(1) per iid (usato in Cruscotto e Storico)."""
+
+    def __init__(self, *, show_tree_column: bool = False, parent: QtWidgets.QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._show_tree_column = show_tree_column
+        self._items_by_id: dict[str, QtWidgets.QTreeWidgetItem] = {}
+        self.setAlternatingRowColors(True)
+        self.setRootIsDecorated(show_tree_column)
+        self.setUniformRowHeights(True)
+        self.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.SingleSelection)
+        self.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.header().setStretchLastSection(True)
+
+    def configure_columns(
+        self,
+        columns: tuple[str, ...],
+        headings: tuple[str, ...],
+        widths: tuple[int, ...],
+        *,
+        tree_heading: str = "",
+        tree_width: int = 150,
+    ) -> None:
+        if self._show_tree_column:
+            self.setColumnCount(len(columns) + 1)
+            self.setHeaderLabels([tree_heading, *headings])
+            self.setColumnWidth(0, tree_width)
+            for idx, w in enumerate(widths, start=1):
+                self.setColumnWidth(idx, w)
+        else:
+            self.setColumnCount(len(columns))
+            self.setHeaderLabels(list(headings))
+            for idx, w in enumerate(widths):
+                self.setColumnWidth(idx, w)
+
+    def get_children(self, parent_iid: str = "") -> tuple[str, ...]:
+        if not parent_iid:
+            res: list[str] = []
+            for i in range(self.topLevelItemCount()):
+                it = self.topLevelItem(i)
+                if it is not None:
+                    iid = it.data(0, Qt.ItemDataRole.UserRole)
+                    if iid:
+                        res.append(str(iid))
+            return tuple(res)
+        parent_item = self._items_by_id.get(parent_iid)
+        if parent_item is None:
+            return ()
+        children_ids: list[str] = []
+        for i in range(parent_item.childCount()):
+            ch = parent_item.child(i)
+            if ch is not None:
+                cid = ch.data(0, Qt.ItemDataRole.UserRole)
+                if cid:
+                    children_ids.append(str(cid))
+        return tuple(children_ids)
+
+    def exists(self, iid: str) -> bool:
+        return iid in self._items_by_id
+
+    def insert(
+        self,
+        parent_iid: str,
+        _index: str | int,
+        *,
+        iid: str,
+        text: str = "",
+        values: tuple[object, ...] = (),
+        open: bool = False,
+    ) -> str:
+        str_vals = [str(v) for v in values]
+        if self._show_tree_column:
+            row_texts = [str(text), *str_vals]
+        else:
+            row_texts = str_vals if str_vals else [str(text)]
+
+        item = QtWidgets.QTreeWidgetItem(row_texts)
+        item.setData(0, Qt.ItemDataRole.UserRole, iid)
+        for col_idx, col_text in enumerate(row_texts):
+            if col_text:
+                item.setToolTip(col_idx, col_text)
+        if parent_iid and parent_iid in self._items_by_id:
+            self._items_by_id[parent_iid].addChild(item)
+        else:
+            self.addTopLevelItem(item)
+        if open:
+            item.setExpanded(True)
+        self._items_by_id[iid] = item
+        return iid
+
+    def item(self, iid: str, option: str | None = None, **kwargs: Any) -> Any:
+        it = self._items_by_id.get(iid)
+        if it is None:
+            return () if option == "values" else {}
+        if "values" in kwargs:
+            vals = [str(v) for v in kwargs["values"]]
+            offset = 1 if self._show_tree_column else 0
+            for idx, val in enumerate(vals):
+                it.setText(idx + offset, val)
+                if val:
+                    it.setToolTip(idx + offset, val)
+        if option == "values":
+            offset = 1 if self._show_tree_column else 0
+            return tuple(it.text(c) for c in range(offset, self.columnCount()))
+        return {
+            "text": it.text(0) if self._show_tree_column else "",
+            "values": tuple(
+                it.text(c) for c in range(1 if self._show_tree_column else 0, self.columnCount())
+            ),
+        }
+
+    def delete(self, *iids: str) -> None:
+        if not iids:
+            return
+        top_count = self.topLevelItemCount()
+        if len(iids) == top_count and top_count > 0:
+            all_match = True
+            for i in range(top_count):
+                top_it = self.topLevelItem(i)
+                if top_it is None or top_it.data(0, Qt.ItemDataRole.UserRole) not in iids:
+                    all_match = False
+                    break
+            if all_match:
+                self.clear()
+                self._items_by_id.clear()
+                return
+        for iid in iids:
+            it = self._items_by_id.pop(iid, None)
+            if it is None:
+                continue
+            for child_idx in range(it.childCount()):
+                child = it.child(child_idx)
+                if child is not None:
+                    cid = child.data(0, Qt.ItemDataRole.UserRole)
+                    if cid:
+                        self._items_by_id.pop(str(cid), None)
+            parent = it.parent()
+            if parent is not None:
+                parent.removeChild(it)
+            else:
+                idx = self.indexOfTopLevelItem(it)
+                if idx >= 0:
+                    self.takeTopLevelItem(idx)
+
+    def selection(self) -> tuple[str, ...]:
+        selected = self.selectedItems()
+        if not selected:
+            return ()
+        iid = selected[0].data(0, Qt.ItemDataRole.UserRole)
+        return (str(iid),) if iid else ()
+
+    def selection_set(self, iid: str) -> None:
+        it = self._items_by_id.get(iid)
+        if it is not None:
+            self.setCurrentItem(it)
+            it.setSelected(True)
+
+    def see(self, iid: str) -> None:
+        it = self._items_by_id.get(iid)
+        if it is not None:
+            self.scrollToItem(it)
+
+
+class _GlossaryEdit(QtWidgets.QPlainTextEdit):
+    """QPlainTextEdit con metodi `.get('1.0', 'end')`, `.delete('1.0', 'end')`, `.insert('1.0', text)`."""
+
+    def get(self, _start: str = "1.0", _end: str = "end") -> str:
+        return self.toPlainText()
+
+    def delete(self, _start: str = "1.0", _end: str = "end") -> None:
+        self.clear()
+
+    def insert(self, _pos: str, text: str) -> None:
+        self.setPlainText(str(text))
+
+
+# ==============================================================================
+# Finestra Principale del Cruscotto in PySide6
+# ==============================================================================
+def _ensure_qt_app() -> QtWidgets.QApplication:
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        if "QT_QPA_PLATFORM" not in os.environ and (
+            "PYTEST_CURRENT_TEST" in os.environ or os.environ.get("TEAMS_SCRIBE_HEADLESS_TRAY") == "1"
+        ):
+            os.environ["QT_QPA_PLATFORM"] = "offscreen"
+        app = QtWidgets.QApplication(sys.argv[:1])
+    assert isinstance(app, QtWidgets.QApplication)
+    return app
+
+
+class DashboardApp(QtWidgets.QMainWindow):
+    """Finestra del cruscotto in PySide6 (Windows 11 Fluent Light/Dark): legge SQLite ogni secondo,
+    gestisce lo storico riunioni e configura settings.json."""
 
     def __init__(
         self,
@@ -265,12 +1122,9 @@ class DashboardApp:
         *,
         initial_tab: str | None = None,
     ) -> None:
-        import tkinter as tk
-        from tkinter import ttk
-
-        self.tk = tk
-        self.ttk = ttk
-        self.root = root
+        self._qt_app = _ensure_qt_app()
+        super().__init__()
+        self.root = root if root is not None else self
         self.registry = registry
         self.settings: AppSettings = load_settings()
         self.output_dir: Path = resolve_output_dir(self.settings)
@@ -279,149 +1133,369 @@ class DashboardApp:
         self._selected_active: str | None = None
         self._last_history_signature: tuple[int, str, str] | None = None
         self._last_auto_day: str = date.today().isoformat()
-        self._refresh_after_id: str | None = None
-        self._setting_vars: dict[tuple[str, str], Any] = {}
-        self._glossary_text: Any = None
-        self._model_combo: Any = None
+        self._setting_vars: dict[tuple[str, str], _ReactiveVar] = {}
+        self._help_labels: list[QtWidgets.QLabel] = []
+        self._glossary_text: _GlossaryEdit | None = None
+        self._model_combo: QtWidgets.QComboBox | None = None
+        self._bg_bridge = _BackgroundBridge(self)
+        self._update_info: UpdateInfo | None = None
+        self._update_installed_version: str | None = None
+        self._checking_updates: bool = False
+        self._installing_update: bool = False
+        self._update_banner_dismissed: bool = False
 
-        root.title(DASHBOARD_TITLE)
-        root.geometry("1180x720")
-        root.minsize(940, 560)
-        style = ttk.Style(root)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        style.configure("Status.TLabel", font=("Segoe UI", 10))
-        style.configure("Warn.TLabel", foreground="#B45309")
-        style.configure("Step.TLabel", font=("Segoe UI", 10))
+        # Tema persistito nel database (default: Windows 11 Fluent Light)
+        saved_theme = "light"
+        try:
+            saved_theme = (self.registry.get_meta("ui_theme") or "light").strip().lower()
+        except Exception:
+            saved_theme = "light"
+        self._theme: str = "dark" if saved_theme == "dark" else "light"
 
-        self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill="both", expand=True, padx=8, pady=8)
-        self.tab_dashboard = ttk.Frame(self.notebook, padding=8)
-        self.tab_history = ttk.Frame(self.notebook, padding=8)
-        self.tab_settings = ttk.Frame(self.notebook, padding=8)
-        self.notebook.add(self.tab_dashboard, text="Cruscotto")
-        self.notebook.add(self.tab_history, text="Storico")
-        self.notebook.add(self.tab_settings, text="Impostazioni")
+        self.setWindowTitle(DASHBOARD_TITLE)
+        self.setMinimumSize(860, 500)
+        screen = self._qt_app.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            target_w = min(1100, max(880, avail.width() - 40))
+            target_h = min(660, max(520, avail.height() - 40))
+            self.resize(target_w, target_h)
+        else:
+            self.resize(1080, 640)
+        if APP_ICON_PATH.exists():
+            self.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
+
+        central = QtWidgets.QWidget(self)
+        self.setCentralWidget(central)
+        main_layout = QtWidgets.QVBoxLayout(central)
+        main_layout.setContentsMargins(8, 6, 8, 6)
+        main_layout.setSpacing(4)
+
+        self._build_update_banner(main_layout)
+
+        self.notebook = QtWidgets.QTabWidget(central)
+        main_layout.addWidget(self.notebook)
+
+        self.tab_dashboard = QtWidgets.QWidget()
+        self.tab_history = QtWidgets.QWidget()
+        self.tab_settings = QtWidgets.QWidget()
+        self.notebook.addTab(self.tab_dashboard, "📊 Cruscotto")
+        self.notebook.addTab(self.tab_history, "🗂️ Storico")
+        self.notebook.addTab(self.tab_settings, "⚙️ Impostazioni")
+
+        # Applica il foglio di stile prima di costruire i widget per avere fontMetrics accurate da subito
+        self.apply_theme(self._theme, persist=False)
 
         self._build_dashboard_tab()
         self._build_history_tab()
         self._build_settings_tab()
-        self.notebook.bind("<<NotebookTabChanged>>", lambda _e: self._on_tab_changed())
+        self.notebook.currentChanged.connect(self._on_tab_changed)
 
         tabs = {"cruscotto": 0, "storico": 1, "impostazioni": 2}
         if initial_tab in tabs:
-            self.notebook.select(tabs[initial_tab])
+            self.notebook.setCurrentIndex(tabs[initial_tab])
+
+        self.apply_theme(self._theme, persist=False)
 
         self._load_history()
         self._refresh()
 
+        self._timer = QTimer(self)
+        self._timer.setInterval(REFRESH_INTERVAL_MS)
+        self._timer.timeout.connect(self._refresh)
+        self._timer.start()
+
+        # Caricamento elenco modelli Ollama posticipato in background per non rallentare l'apertura
+        QTimer.singleShot(50, lambda: self._refresh_models(silent=True))
+
+        # Controllo automatico aggiornamenti su GitHub all'avvio del pannello (se abilitato)
+        if (
+            getattr(self.settings.execution, "auto_check_updates", True)
+            and "PYTEST_CURRENT_TEST" not in os.environ
+            and os.environ.get("QT_QPA_PLATFORM") != "offscreen"
+        ):
+            QTimer.singleShot(250, lambda: self._check_updates(silent=True))
+
+    def _build_update_banner(self, parent_layout: QtWidgets.QVBoxLayout) -> None:
+        """Costruisce il banner superiore per la notifica, il download e il riavvio post-aggiornamento."""
+        self.update_banner = QtWidgets.QFrame(self)
+        self.update_banner.setObjectName("updateBanner")
+        self.update_banner.setVisible(False)
+
+        banner_layout = QtWidgets.QHBoxLayout(self.update_banner)
+        banner_layout.setContentsMargins(8, 4, 8, 4)
+        banner_layout.setSpacing(8)
+
+        self.var_update_banner = _ReactiveVar("")
+        self.lbl_update_banner = self.var_update_banner.bind_Label(QtWidgets.QLabel())
+        self.lbl_update_banner.setProperty("labelRole", "updateTitle")
+        self.lbl_update_banner.setWordWrap(True)
+        banner_layout.addWidget(self.lbl_update_banner, 1)
+
+        self.update_progress_bar = _FluentProgressBar()
+        self.update_progress_bar.setRange(0, 100)
+        self.update_progress_bar.setValue(0)
+        self.update_progress_bar.setFixedWidth(140)
+        self.update_progress_bar.setVisible(False)
+        banner_layout.addWidget(self.update_progress_bar)
+
+        self.btn_release_notes = _FluentButton("📋 Note di rilascio")
+        self.btn_release_notes.clicked.connect(self._show_release_notes)
+        banner_layout.addWidget(self.btn_release_notes)
+
+        self.btn_install_update = _FluentButton("⬇️ Scarica e installa")
+        self.btn_install_update.setProperty("btnRole", "primary")
+        self.btn_install_update.clicked.connect(self._cmd_install_update)
+        banner_layout.addWidget(self.btn_install_update)
+
+        self.btn_restart_after_update = _FluentButton("🚀 Riavvia ora")
+        self.btn_restart_after_update.setProperty("btnRole", "primary")
+        self.btn_restart_after_update.setVisible(False)
+        self.btn_restart_after_update.clicked.connect(lambda: self._cmd_restart_app(skip_confirm=True))
+        banner_layout.addWidget(self.btn_restart_after_update)
+
+        self.btn_dismiss_update = _FluentButton("✕")
+        self.btn_dismiss_update.setFixedWidth(30)
+        self.btn_dismiss_update.setToolTip("Nascondi avviso aggiornamento")
+        self.btn_dismiss_update.clicked.connect(self._dismiss_update_banner)
+        banner_layout.addWidget(self.btn_dismiss_update)
+
+        parent_layout.addWidget(self.update_banner)
+
+    # ============================================================ gestione tema
+    @property
+    def current_theme(self) -> str:
+        return self._theme
+
+    def apply_theme(self, theme: str, *, persist: bool = True) -> None:
+        """Applica il tema Windows 11 Fluent ('light' o 'dark') e aggiorna il pulsante selettore."""
+        normalized = "dark" if str(theme).strip().lower() == "dark" else "light"
+        self._theme = normalized
+        self.setStyleSheet(FLUENT_DARK_QSS if normalized == "dark" else FLUENT_LIGHT_QSS)
+        if hasattr(self, "btn_theme"):
+            self.btn_theme.setText("☀️ Tema Chiaro" if normalized == "dark" else "🌙 Tema Scuro")
+            self.btn_theme.setToolTip(
+                "Passa al tema Windows 11 Fluent Chiaro"
+                if normalized == "dark"
+                else "Passa al tema Windows 11 Fluent Scuro"
+            )
+        if persist:
+            try:
+                self.registry.set_meta("ui_theme", normalized)
+            except Exception as exc:
+                logger.debug("Salvataggio preferenza tema non riuscito: %s", exc)
+
+    def toggle_theme(self) -> str:
+        next_theme = "dark" if self._theme == "light" else "light"
+        self.apply_theme(next_theme, persist=True)
+        return self._theme
+
     # ============================================================ cruscotto
     def _build_dashboard_tab(self) -> None:
-        tk, ttk = self.tk, self.ttk
-        frame = self.tab_dashboard
+        layout = QtWidgets.QVBoxLayout(self.tab_dashboard)
+        layout.setContentsMargins(8, 4, 8, 6)
+        layout.setSpacing(6)
 
-        status = ttk.LabelFrame(frame, text="Stato", padding=6)
-        status.pack(fill="x")
-        self.var_app = tk.StringVar(value="Applicazione: -")
-        self.var_watcher = tk.StringVar(value="Watcher: -")
-        self.var_gpu = tk.StringVar(value="LLM su GPU: -")
-        self.var_models = tk.StringVar(value="Modelli: -")
-        self.var_queue = tk.StringVar(value="Coda: -")
-        for column, var in enumerate(
-            (self.var_app, self.var_watcher, self.var_gpu, self.var_models, self.var_queue)
-        ):
-            ttk.Label(status, textvariable=var, style="Status.TLabel").grid(
-                row=0, column=column, sticky="w", padx=(0, 18)
-            )
-        self.incognito_var = tk.BooleanVar(value=bool(self.settings.detection.incognito_mode))
-        self.incognito_btn = ttk.Checkbutton(
-            status,
-            text="Modalità in incognito (Zero Popup)",
-            variable=self.incognito_var,
-            command=self._on_toggle_incognito_quick,
-        )
-        self.incognito_btn.grid(row=0, column=5, sticky="e", padx=(18, 0))
-        status.columnconfigure(5, weight=1)
+        # Card Stato Superiore compatta su 2 righe
+        status_box = QtWidgets.QGroupBox("Stato Sistema")
+        status_vbox = QtWidgets.QVBoxLayout(status_box)
+        status_vbox.setContentsMargins(8, 6, 8, 4)
+        status_vbox.setSpacing(3)
 
-        buttons = ttk.Frame(frame)
-        buttons.pack(fill="x", pady=(8, 4))
-        ttk.Button(buttons, text="Avvia registrazione manuale", command=self._cmd_start_manual).pack(side="left")
-        ttk.Button(buttons, text="Termina call ora", command=self._cmd_finalize).pack(side="left", padx=4)
-        self.btn_pause = ttk.Button(buttons, text="⏸ Pausa", command=self._cmd_toggle_pause)
-        self.btn_pause.pack(side="left", padx=4)
-        self.btn_pause.state(["disabled"])
-        self.btn_stop = ttk.Button(buttons, text="Arresta elaborazione", command=self._cmd_stop_selected)
-        self.btn_stop.pack(side="left", padx=4)
-        self.btn_stop.state(["disabled"])
-        self.btn_delete_active_job = ttk.Button(
-            buttons,
-            text="Elimina transazione",
-            command=self._on_delete_active_selected,
+        self.var_version = _ReactiveVar(f"Versione: v{APP_VERSION}")
+        self.var_app = _ReactiveVar("Applicazione: -")
+        self.var_watcher = _ReactiveVar("Watcher: -")
+        self.var_gpu = _ReactiveVar("LLM su GPU: -")
+        self.var_models = _ReactiveVar("Modelli: -")
+        self.var_queue = _ReactiveVar("Coda: -")
+
+        status_row1 = QtWidgets.QHBoxLayout()
+        status_row1.setSpacing(14)
+        self.lbl_version = self.var_version.bind_Label(QtWidgets.QLabel())
+        self.lbl_version.setProperty("labelRole", "version")
+        self.lbl_version.setToolTip(f"Versione corrente di {APP_NAME}: v{APP_VERSION}")
+        status_row1.addWidget(self.lbl_version)
+
+        for var in (self.var_app, self.var_watcher, self.var_queue):
+            lbl = var.bind_Label(QtWidgets.QLabel())
+            status_row1.addWidget(lbl)
+        status_row1.addStretch(1)
+
+        self.incognito_var = _ReactiveVar(bool(self.settings.detection.incognito_mode))
+        self.incognito_btn = self.incognito_var.bind_CheckBox(
+            QtWidgets.QCheckBox("Modalità in incognito (Zero Popup)")
         )
-        self.btn_delete_active_job.pack(side="left", padx=4)
-        self.btn_delete_active_job.state(["disabled"])
-        ttk.Button(buttons, text="Riprova", command=self._cmd_retry_selected).pack(side="left", padx=4)
-        ttk.Button(buttons, text="📂 Importa Registrazione", command=self._cmd_import_recording).pack(side="left", padx=4)
-        ttk.Button(buttons, text="Copia bozza mail", command=self._cmd_copy_email).pack(side="left", padx=4)
-        ttk.Button(buttons, text="Apri DOCX", command=self._open_selected_docx).pack(side="left", padx=4)
-        ttk.Button(buttons, text="Apri cartella", command=self._open_selected_folder).pack(side="left", padx=4)
+        self.incognito_btn.clicked.connect(self._on_toggle_incognito_quick)
+        status_row1.addWidget(self.incognito_btn)
+
+        self.btn_theme = _FluentButton("🌙 Tema Scuro")
+        self.btn_theme.clicked.connect(self.toggle_theme)
+        status_row1.addWidget(self.btn_theme)
+        status_vbox.addLayout(status_row1)
+
+        status_row2 = QtWidgets.QHBoxLayout()
+        status_row2.setSpacing(18)
+        for var in (self.var_gpu, self.var_models):
+            lbl = var.bind_Label(QtWidgets.QLabel())
+            status_row2.addWidget(lbl)
+        status_row2.addStretch(1)
+
+        self.btn_check_updates = _FluentButton("🔄 Verifica aggiornamenti")
+        self.btn_check_updates.setToolTip("Controlla su GitHub se è disponibile una nuova versione")
+        self.btn_check_updates.clicked.connect(self._cmd_check_updates)
+        status_row2.addWidget(self.btn_check_updates)
+
+        self.btn_restart_app = _FluentButton("🔁 Riavvia app")
+        self.btn_restart_app.setToolTip("Riavvia il servizio in background e il Cruscotto")
+        self.btn_restart_app.clicked.connect(lambda: self._cmd_restart_app(skip_confirm=False))
+        status_row2.addWidget(self.btn_restart_app)
+        status_vbox.addLayout(status_row2)
+
+        layout.addWidget(status_box)
+
+        # Barra Pulsanti Azione compatta
+        btn_vbox = QtWidgets.QVBoxLayout()
+        btn_vbox.setSpacing(4)
+
+        btn_row1 = QtWidgets.QHBoxLayout()
+        btn_row1.setSpacing(6)
+
+        btn_start = _FluentButton("▶ Avvia registrazione manuale")
+        btn_start.setProperty("btnRole", "primary")
+        btn_start.clicked.connect(self._cmd_start_manual)
+        btn_row1.addWidget(btn_start)
+
+        btn_fin = _FluentButton("⏹ Termina call ora")
+        btn_fin.clicked.connect(self._cmd_finalize)
+        btn_row1.addWidget(btn_fin)
+
+        self.btn_pause = _FluentButton("⏸ Pausa")
+        self.btn_pause.setEnabled(False)
+        self.btn_pause.clicked.connect(self._cmd_toggle_pause)
+        btn_row1.addWidget(self.btn_pause)
+
+        self.btn_stop = _FluentButton("Arresta elaborazione")
+        self.btn_stop.setProperty("btnRole", "danger")
+        self.btn_stop.setEnabled(False)
+        self.btn_stop.clicked.connect(self._cmd_stop_selected)
+        btn_row1.addWidget(self.btn_stop)
+
+        btn_retry = _FluentButton("🔄 Riprova")
+        btn_retry.clicked.connect(self._cmd_retry_selected)
+        btn_row1.addWidget(btn_retry)
+
+        btn_import = _FluentButton("📂 Importa Registrazione")
+        btn_import.clicked.connect(self._cmd_import_recording)
+        btn_row1.addWidget(btn_import)
+        btn_row1.addStretch(1)
+        btn_vbox.addLayout(btn_row1)
+
+        btn_row2 = QtWidgets.QHBoxLayout()
+        btn_row2.setSpacing(6)
+
+        btn_docx = _FluentButton("📄 Apri DOCX")
+        btn_docx.clicked.connect(self._open_selected_docx)
+        btn_row2.addWidget(btn_docx)
+
+        btn_folder = _FluentButton("📁 Apri cartella")
+        btn_folder.clicked.connect(self._open_selected_folder)
+        btn_row2.addWidget(btn_folder)
+
+        btn_email = _FluentButton("✉️ Copia bozza mail")
+        btn_email.clicked.connect(self._cmd_copy_email)
+        btn_row2.addWidget(btn_email)
+
+        self.btn_delete_active_job = _FluentButton("Elimina transazione")
+        self.btn_delete_active_job.setProperty("btnRole", "danger")
+        self.btn_delete_active_job.setEnabled(False)
+        self.btn_delete_active_job.clicked.connect(self._on_delete_active_selected)
+        btn_row2.addWidget(self.btn_delete_active_job)
+        btn_row2.addStretch(1)
+        btn_vbox.addLayout(btn_row2)
+
+        layout.addLayout(btn_vbox)
+
+        # Splitter verticale tra Tabella Sessioni Attive e Dettaglio Elaborazione (ottimizzato per 14")
+        splitter = QtWidgets.QSplitter(Qt.Orientation.Vertical)
+        splitter.setChildrenCollapsible(False)
 
         columns = ("title", "start", "status", "stage", "progress", "in_stage", "total")
         headings = ("Titolo", "Inizio", "Stato", "Fase", "Avanzamento", "Tempo in fase", "Tempo totale")
-        widths = (275, 110, 170, 210, 165, 100, 100)
-        self.active_tree = ttk.Treeview(frame, columns=columns, show="headings", height=8, selectmode="browse")
-        for col, heading, width in zip(columns, headings, widths, strict=True):
-            self.active_tree.heading(col, text=heading)
-            self.active_tree.column(col, width=width, anchor="w")
-        self.active_tree.pack(fill="x", pady=(4, 6))
-        self.active_tree.bind("<<TreeviewSelect>>", lambda _e: self._on_active_select())
-        self.active_tree.bind("<Double-1>", lambda _e: self._open_selected_docx())
-        self.active_tree.bind("<Delete>", lambda _e: self._on_delete_active_selected())
-        self._active_menu = tk.Menu(self.active_tree, tearoff=0)
-        self._active_menu.add_command(label="Apri Word", command=self._open_selected_docx)
-        self._active_menu.add_command(label="Riprova", command=self._cmd_retry_selected)
-        self._active_menu.add_command(label="Pausa / Riprendi", command=self._cmd_toggle_pause)
-        self._active_menu.add_command(label="Arresta", command=self._cmd_stop_selected)
-        self._active_menu.add_command(label="Importa Registrazione", command=self._cmd_import_recording)
-        self._active_menu.add_separator()
-        self._active_menu.add_command(
-            label="Elimina completamente la transazione",
-            command=self._on_delete_active_selected,
-        )
-        self.active_tree.bind("<Button-3>", self._on_active_right_click)
+        widths = (220, 85, 110, 210, 130, 90, 90)
+        self.active_tree = _FluentTreeWidget(show_tree_column=False)
+        self.active_tree.configure_columns(columns, headings, widths)
+        self.active_tree.setMinimumHeight(78)
+        self.active_tree.itemSelectionChanged.connect(self._on_active_select)
+        self.active_tree.itemDoubleClicked.connect(lambda _it, _col: self._open_selected_docx())
+        self.active_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.active_tree.customContextMenuRequested.connect(self._on_active_context_menu)
 
-        detail = ttk.LabelFrame(frame, text="Dettaglio", padding=6)
-        detail.pack(fill="both", expand=True)
-        steps = ttk.Frame(detail)
-        steps.pack(fill="x")
-        self.step_vars: list[Any] = []
+        del_active_shortcut = QtGui.QShortcut(QtGui.QKeySequence(Qt.Key.Key_Delete), self.active_tree)
+        del_active_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        del_active_shortcut.activated.connect(self._on_delete_active_selected)
+
+        self._active_menu = QtWidgets.QMenu(self.active_tree)
+        self._active_menu.addAction("Apri Word", self._open_selected_docx)
+        self._active_menu.addAction("Riprova", self._cmd_retry_selected)
+        self._active_menu.addAction("Pausa / Riprendi", self._cmd_toggle_pause)
+        self._active_menu.addAction("Arresta", self._cmd_stop_selected)
+        self._active_menu.addAction("Importa Registrazione", self._cmd_import_recording)
+        self._active_menu.addSeparator()
+        self._active_menu.addAction("Elimina completamente la transazione", self._on_delete_active_selected)
+        splitter.addWidget(self.active_tree)
+
+        # Pannello Dettaglio e Pipeline (espanso verticalmente per una navigazione agevole su 14")
+        detail_box = QtWidgets.QGroupBox("Dettaglio Elaborazione e Ultimi Eventi")
+        detail_layout = QtWidgets.QVBoxLayout(detail_box)
+        detail_layout.setContentsMargins(8, 4, 8, 6)
+        detail_layout.setSpacing(4)
+
+        steps_row = QtWidgets.QHBoxLayout()
+        steps_row.setSpacing(4)
+        self.step_vars: list[_ReactiveVar] = []
         for index, name in enumerate(PIPELINE_STEPS):
-            var = tk.StringVar(value=f"○ {name}")
+            var = _ReactiveVar(f"○ {name}")
             self.step_vars.append(var)
-            ttk.Label(steps, textvariable=var, style="Step.TLabel").grid(row=0, column=index * 2, padx=2)
+            lbl_step = var.bind_Label(QtWidgets.QLabel())
+            lbl_step.setProperty("labelRole", "step")
+            steps_row.addWidget(lbl_step)
             if index < len(PIPELINE_STEPS) - 1:
-                ttk.Label(steps, text="→").grid(row=0, column=index * 2 + 1)
-        progress_frame = ttk.Frame(detail)
-        progress_frame.pack(fill="x", pady=(6, 2))
-        self.progress_bar = ttk.Progressbar(
-            progress_frame,
-            orient="horizontal",
-            mode="determinate",
-            maximum=100,
-            length=260,
-        )
-        self.progress_bar.pack(side="left", padx=(0, 10))
-        self.var_progress_pct = tk.StringVar(value="Avanzamento elaborazione: -")
-        ttk.Label(progress_frame, textvariable=self.var_progress_pct, style="Status.TLabel").pack(
-            side="left", anchor="w"
-        )
-        self.var_error = tk.StringVar(value="")
-        ttk.Label(detail, textvariable=self.var_error, style="Warn.TLabel", wraplength=1050).pack(
-            fill="x", pady=(6, 2)
-        )
-        ttk.Label(detail, text="Ultimi eventi").pack(anchor="w")
-        self.events_list = tk.Listbox(detail, height=10, font=("Consolas", 9))
-        self.events_list.pack(fill="both", expand=True)
+                arrow = QtWidgets.QLabel("→")
+                arrow.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                steps_row.addWidget(arrow)
+        steps_row.addStretch(1)
+        detail_layout.addLayout(steps_row)
+
+        prog_row = QtWidgets.QHBoxLayout()
+        prog_row.setSpacing(10)
+        self.progress_bar = _FluentProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFixedWidth(180)
+        prog_row.addWidget(self.progress_bar)
+
+        self.var_progress_pct = _ReactiveVar("Avanzamento elaborazione: -")
+        prog_row.addWidget(self.var_progress_pct.bind_Label(QtWidgets.QLabel()), 1)
+        detail_layout.addLayout(prog_row)
+
+        self.var_error = _ReactiveVar("")
+        self._lbl_error = self.var_error.bind_Label(QtWidgets.QLabel())
+        self._lbl_error.setProperty("labelRole", "warn")
+        self._lbl_error.setWordWrap(True)
+        self._lbl_error.setVisible(False)
+        detail_layout.addWidget(self._lbl_error)
+
+        self.events_list = _FluentEventsList()
+        self.events_list.setObjectName("eventsList")
+        self.events_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.events_list.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        detail_layout.addWidget(self.events_list, 1)
+
+        splitter.addWidget(detail_box)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([105, 340])
+        layout.addWidget(splitter, 1)
 
     def _send(self, command: str, payload: dict[str, object] | None = None) -> None:
         try:
@@ -446,19 +1520,19 @@ class DashboardApp:
             self._send(UiCommandType.TOGGLE_PAUSE.value)
 
     def _cmd_import_recording(self) -> None:
-        from tkinter import filedialog, simpledialog
         import config as _cfg
 
-        filetypes = [
-            ("File Audio e Video", "*.wav *.mp3 *.m4a *.mp4 *.mkv *.ogg *.flac *.webm *.aac *.wma"),
-            ("File Audio", "*.wav *.mp3 *.m4a *.ogg *.flac *.aac *.wma"),
-            ("File Video", "*.mp4 *.mkv *.webm"),
-            ("Tutti i file", "*.*"),
-        ]
-        filename = filedialog.askopenfilename(
-            title="Seleziona file audio o video da importare",
-            filetypes=filetypes,
-            parent=self.root,
+        filter_str = (
+            "File Audio e Video (*.wav *.mp3 *.m4a *.mp4 *.mkv *.ogg *.flac *.webm *.aac *.wma);;"
+            "File Audio (*.wav *.mp3 *.m4a *.ogg *.flac *.aac *.wma);;"
+            "File Video (*.mp4 *.mkv *.webm);;"
+            "Tutti i file (*.*)"
+        )
+        filename, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Seleziona file audio o video da importare",
+            "",
+            filter_str,
         )
         if not filename:
             return
@@ -472,13 +1546,14 @@ class DashboardApp:
             return
 
         default_title = src_path.stem.replace("_", " ").title()
-        title = simpledialog.askstring(
+        title, ok = QtWidgets.QInputDialog.getText(
+            self,
             "Titolo Riunione",
             "Inserisci il titolo della riunione (opzionale):",
-            initialvalue=default_title,
-            parent=self.root,
+            QtWidgets.QLineEdit.EchoMode.Normal,
+            default_title,
         )
-        if title is None:
+        if not ok:
             return
         meeting_title = title.strip() or default_title
 
@@ -513,7 +1588,7 @@ class DashboardApp:
                 "Importazione avviata",
                 f"Elaborazione in background di '{src_path.name}' in corso...",
             )
-            _run_in_background(self.root, _work, _done)
+            _run_in_background(self, _work, _done)
 
     def _cmd_stop_selected(self) -> None:
         session_id = self._selected_active
@@ -579,8 +1654,9 @@ class DashboardApp:
             )
             return
 
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
+        clipboard = QtWidgets.QApplication.clipboard()
+        if clipboard is not None:
+            clipboard.setText(text)
         self._info("Copia bozza mail", "Bozza email copiata negli appunti con successo!")
 
     def _cmd_retry_selected(self) -> None:
@@ -592,7 +1668,7 @@ class DashboardApp:
         self._info("Riprova", "Richiesta inviata: la sessione verrà rimessa in coda.")
 
     def _job_for_action(self) -> dict[str, object] | None:
-        if self.notebook.index(self.notebook.select()) == 1:
+        if self.notebook.currentIndex() == 1:
             session_id = self._selected_history_id()
             return self._history_rows.get(session_id) if session_id else None
         return self._active_jobs.get(self._selected_active or "")
@@ -670,12 +1746,14 @@ class DashboardApp:
         self._update_action_buttons()
         self._refresh_detail()
 
-    def _on_active_right_click(self, event: Any) -> None:
-        row_id = self.active_tree.identify_row(event.y)
-        if row_id:
-            self.active_tree.selection_set(row_id)
-            self._on_active_select()
-            self._active_menu.tk_popup(event.x_root, event.y_root)
+    def _on_active_context_menu(self, pos: QtCore.QPoint) -> None:
+        item = self.active_tree.itemAt(pos)
+        if item is not None:
+            iid = item.data(0, Qt.ItemDataRole.UserRole)
+            if iid:
+                self.active_tree.selection_set(str(iid))
+                self._on_active_select()
+                self._active_menu.exec(self.active_tree.viewport().mapToGlobal(pos))
 
     def _on_delete_active_selected(self) -> None:
         sid = self._selected_active
@@ -691,20 +1769,11 @@ class DashboardApp:
             self._refresh_history_if_changed()
         except Exception as exc:
             logger.debug("Aggiornamento del cruscotto non riuscito: %s", exc)
-        finally:
-            if self._refresh_after_id is not None:
-                try:
-                    self.root.after_cancel(self._refresh_after_id)
-                except Exception:
-                    pass
-            try:
-                self._refresh_after_id = self.root.after(REFRESH_INTERVAL_MS, self._refresh)
-            except Exception:
-                self._refresh_after_id = None
 
-    def _on_tab_changed(self) -> None:
+    def _on_tab_changed(self, index: int = -1) -> None:
         try:
-            if self.notebook.index(self.notebook.select()) == 1:
+            idx = index if index >= 0 else self.notebook.currentIndex()
+            if idx == 1:
                 self._load_history()
         except Exception as exc:
             logger.debug("Aggiornamento al cambio scheda non riuscito: %s", exc)
@@ -713,7 +1782,7 @@ class DashboardApp:
         today_iso = date.today().isoformat()
         day_shifted = False
         if today_iso != self._last_auto_day:
-            if hasattr(self, "var_day") and self.var_day.get().strip() == self._last_auto_day:
+            if hasattr(self, "var_day") and str(self.var_day.get()).strip() == self._last_auto_day:
                 self.var_day.set(today_iso)
                 day_shifted = True
             self._last_auto_day = today_iso
@@ -725,7 +1794,7 @@ class DashboardApp:
         status = self.registry.get_status()
         heartbeat = parse_iso(status.get("heartbeat"))
         alive = heartbeat is not None and (now_tz() - heartbeat).total_seconds() < HEARTBEAT_STALE_SEC
-        self.var_app.set(f"Applicazione: {'attiva' if alive else 'non in esecuzione'}")
+        self.var_app.set(f"Applicazione: {'🟢 attiva' if alive else '⚪ non in esecuzione'}")
 
         incognito_state = status.get("incognito_mode")
         if isinstance(incognito_state, bool) and alive:
@@ -757,6 +1826,22 @@ class DashboardApp:
         )
         queue_len = status.get("queue_length")
         self.var_queue.set(f"Coda: {queue_len if isinstance(queue_len, int) else '-'}")
+
+        if self._update_installed_version:
+            self.var_version.set(
+                f"Versione: v{APP_VERSION} → v{self._update_installed_version} (riavvio richiesto)"
+            )
+        elif self._update_info is None and not self._update_banner_dismissed:
+            try:
+                raw_upd = self.registry.get_meta("update_info")
+                if raw_upd:
+                    parsed_upd = json.loads(raw_upd)
+                    if isinstance(parsed_upd, dict):
+                        cached_info = UpdateInfo.from_dict(parsed_upd)
+                        if is_newer_version(cached_info.latest_version, APP_VERSION):
+                            self._apply_update_info(cached_info, show_up_to_date_dialog=False)
+            except Exception as exc:
+                logger.debug("Lettura stato aggiornamento da SQLite non riuscita: %s", exc)
 
     def _refresh_active_jobs(self) -> None:
         jobs = self.registry.list_active_jobs()
@@ -799,6 +1884,8 @@ class DashboardApp:
             if hasattr(self, "var_progress_pct"):
                 self.var_progress_pct.set("Avanzamento elaborazione: -")
             self.var_error.set("Nessuna sessione attiva.")
+            if hasattr(self, "_lbl_error"):
+                self._lbl_error.setVisible(False)
             self.events_list.delete(0, "end")
             return
         marks = pipeline_marks(str(job.get("stage") or ""), str(job.get("status") or ""))
@@ -830,7 +1917,10 @@ class DashboardApp:
             message += f"  — nuovo tentativo alle {retry_at.strftime('%H:%M:%S')}"
         if job.get("status") == "parked":
             message += "  — usare Riprova per rimetterla in coda"
-        self.var_error.set(message.strip())
+        cleaned_msg = message.strip()
+        self.var_error.set(cleaned_msg)
+        if hasattr(self, "_lbl_error"):
+            self._lbl_error.setVisible(bool(cleaned_msg))
         events = self.registry.get_events(str(job["session_id"]), limit=40)
         self.events_list.delete(0, "end")
         for event in reversed(events):
@@ -842,94 +1932,169 @@ class DashboardApp:
 
     # ============================================================== storico
     def _build_history_tab(self) -> None:
-        tk, ttk = self.tk, self.ttk
-        frame = self.tab_history
-        filters = ttk.Frame(frame)
-        filters.pack(fill="x")
+        layout = QtWidgets.QVBoxLayout(self.tab_history)
+        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setSpacing(6)
 
-        self.var_day = tk.StringVar(value=date.today().isoformat())
-        self.var_all_days = tk.BooleanVar(value=False)
-        self.var_from = tk.StringVar(value="")
-        self.var_to = tk.StringVar(value="")
-        self.var_status = tk.StringVar(value=HISTORY_STATUS_FILTERS[0][0])
-        self.var_text = tk.StringVar(value="")
+        filters_vbox = QtWidgets.QVBoxLayout()
+        filters_vbox.setSpacing(4)
 
-        ttk.Label(filters, text="Giorno").grid(row=0, column=0, sticky="w")
-        ttk.Button(filters, text="◀", width=3, command=lambda: self._shift_day(-1)).grid(row=0, column=1)
-        day_entry = ttk.Entry(filters, textvariable=self.var_day, width=11)
-        day_entry.grid(row=0, column=2)
-        day_entry.bind("<Return>", lambda _e: self._load_history())
-        ttk.Button(filters, text="▶", width=3, command=lambda: self._shift_day(1)).grid(row=0, column=3)
-        ttk.Button(filters, text="Oggi", command=self._today).grid(row=0, column=4, padx=(4, 12))
-        ttk.Checkbutton(filters, text="Tutti i giorni", variable=self.var_all_days, command=self._load_history).grid(
-            row=0, column=5, padx=(0, 12)
-        )
-        ttk.Label(filters, text="Dal").grid(row=0, column=6)
-        from_entry = ttk.Entry(filters, textvariable=self.var_from, width=11)
-        from_entry.grid(row=0, column=7, padx=2)
-        from_entry.bind("<Return>", lambda _e: self._load_history())
-        ttk.Label(filters, text="Al").grid(row=0, column=8)
-        to_entry = ttk.Entry(filters, textvariable=self.var_to, width=11)
-        to_entry.grid(row=0, column=9, padx=(2, 12))
-        to_entry.bind("<Return>", lambda _e: self._load_history())
-        ttk.Label(filters, text="Esito").grid(row=0, column=10)
-        status_combo = ttk.Combobox(
-            filters,
-            textvariable=self.var_status,
-            values=[label for label, _ in HISTORY_STATUS_FILTERS],
-            state="readonly",
-            width=20,
-        )
-        status_combo.grid(row=0, column=11, padx=(2, 12))
-        status_combo.bind("<<ComboboxSelected>>", lambda _e: self._load_history())
-        ttk.Label(filters, text="Testo").grid(row=0, column=12)
-        text_entry = ttk.Entry(filters, textvariable=self.var_text, width=18)
-        text_entry.grid(row=0, column=13, padx=2)
-        text_entry.bind("<Return>", lambda _e: self._load_history())
-        ttk.Button(filters, text="Cerca", command=self._load_history).grid(row=0, column=14, padx=4)
+        self.var_day = _ReactiveVar(date.today().isoformat())
+        self.var_all_days = _ReactiveVar(False)
+        self.var_from = _ReactiveVar("")
+        self.var_to = _ReactiveVar("")
+        self.var_status = _ReactiveVar(HISTORY_STATUS_FILTERS[0][0])
+        self.var_text = _ReactiveVar("")
+
+        filters_row1 = QtWidgets.QHBoxLayout()
+        filters_row1.setSpacing(6)
+        filters_row1.addWidget(QtWidgets.QLabel("Giorno"))
+        btn_prev = _FluentButton("◀")
+        btn_prev.setFixedWidth(30)
+        btn_prev.clicked.connect(lambda: self._shift_day(-1))
+        filters_row1.addWidget(btn_prev)
+
+        day_entry = self.var_day.bind_LineEdit(QtWidgets.QLineEdit())
+        day_entry.setFixedWidth(96)
+        day_entry.setMinimumHeight(26)
+        day_entry.returnPressed.connect(self._load_history)
+        filters_row1.addWidget(day_entry)
+
+        btn_next = _FluentButton("▶")
+        btn_next.setFixedWidth(30)
+        btn_next.clicked.connect(lambda: self._shift_day(1))
+        filters_row1.addWidget(btn_next)
+
+        btn_today = _FluentButton("Oggi")
+        btn_today.clicked.connect(self._today)
+        filters_row1.addWidget(btn_today)
+
+        chk_all = self.var_all_days.bind_CheckBox(QtWidgets.QCheckBox("Tutti i giorni"))
+        chk_all.clicked.connect(self._load_history)
+        filters_row1.addWidget(chk_all)
+
+        filters_row1.addSpacing(10)
+        filters_row1.addWidget(QtWidgets.QLabel("Dal"))
+        from_entry = self.var_from.bind_LineEdit(QtWidgets.QLineEdit())
+        from_entry.setFixedWidth(96)
+        from_entry.setMinimumHeight(26)
+        from_entry.setPlaceholderText("YYYY-MM-DD")
+        from_entry.returnPressed.connect(self._load_history)
+        filters_row1.addWidget(from_entry)
+
+        filters_row1.addWidget(QtWidgets.QLabel("Al"))
+        to_entry = self.var_to.bind_LineEdit(QtWidgets.QLineEdit())
+        to_entry.setFixedWidth(96)
+        to_entry.setMinimumHeight(26)
+        to_entry.setPlaceholderText("YYYY-MM-DD")
+        to_entry.returnPressed.connect(self._load_history)
+        filters_row1.addWidget(to_entry)
+        filters_row1.addStretch(1)
+        filters_vbox.addLayout(filters_row1)
+
+        filters_row2 = QtWidgets.QHBoxLayout()
+        filters_row2.setSpacing(6)
+        filters_row2.addWidget(QtWidgets.QLabel("Esito"))
+        status_combo = QtWidgets.QComboBox()
+        status_combo.setMinimumWidth(165)
+        status_combo.setMinimumHeight(26)
+        status_combo.addItems([label for label, _ in HISTORY_STATUS_FILTERS])
+        self.var_status.bind_ComboBox(status_combo)
+        status_combo.currentIndexChanged.connect(lambda _i: self._load_history())
+        filters_row2.addWidget(status_combo)
+
+        filters_row2.addSpacing(10)
+        filters_row2.addWidget(QtWidgets.QLabel("Testo"))
+        text_entry = self.var_text.bind_LineEdit(QtWidgets.QLineEdit())
+        text_entry.setMinimumWidth(200)
+        text_entry.setMinimumHeight(26)
+        text_entry.setPlaceholderText("Cerca nel titolo...")
+        text_entry.returnPressed.connect(self._load_history)
+        filters_row2.addWidget(text_entry)
+
+        btn_search = _FluentButton("🔍 Cerca")
+        btn_search.setProperty("btnRole", "primary")
+        btn_search.clicked.connect(self._load_history)
+        filters_row2.addWidget(btn_search)
+        filters_row2.addStretch(1)
+        filters_vbox.addLayout(filters_row2)
+
+        layout.addLayout(filters_vbox)
 
         columns = ("time", "title", "call", "processing", "outcome", "model", "file")
         headings = ("Data", "Titolo", "Durata call", "Durata elaborazione", "Esito", "Modello", "File")
-        widths = (130, 280, 90, 120, 170, 110, 260)
-        self.history_tree = ttk.Treeview(frame, columns=columns, show="tree headings", selectmode="browse")
-        self.history_tree.column("#0", width=150, anchor="w")
-        self.history_tree.heading("#0", text="Giorno")
-        for col, heading, width in zip(columns, headings, widths, strict=True):
-            self.history_tree.heading(col, text=heading)
-            self.history_tree.column(col, width=width, anchor="w")
-        self.history_tree.pack(fill="both", expand=True, pady=6)
-        self.history_tree.bind("<<TreeviewSelect>>", lambda _e: self._on_history_select())
-        self.history_tree.bind("<Double-1>", lambda _e: self._show_timeline())
-        self.history_tree.bind("<Delete>", lambda _e: self._on_history_delete())
-        self._history_menu = tk.Menu(self.history_tree, tearoff=0)
-        self._history_menu.add_command(label="Apri Word", command=self._open_selected_docx)
-        self._history_menu.add_command(label="Apri cartella", command=self._open_selected_folder)
-        self._history_menu.add_command(label="Riprocessa", command=self._reprocess_selected)
-        self._history_menu.add_separator()
-        self._history_menu.add_command(
-            label="Elimina completamente la transazione",
-            command=self._on_history_delete,
+        widths = (110, 225, 85, 130, 125, 100, 200)
+        self.history_tree = _FluentTreeWidget(show_tree_column=True)
+        self.history_tree.configure_columns(
+            columns,
+            headings,
+            widths,
+            tree_heading="Giorno",
+            tree_width=115,
         )
-        self.history_tree.bind("<Button-3>", self._on_history_right_click)
+        self.history_tree.itemSelectionChanged.connect(self._on_history_select)
+        self.history_tree.itemDoubleClicked.connect(lambda _it, _col: self._show_timeline())
+        self.history_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.history_tree.customContextMenuRequested.connect(self._on_history_context_menu)
 
-        actions = ttk.Frame(frame)
-        actions.pack(fill="x")
-        ttk.Button(actions, text="Apri DOCX", command=self._open_selected_docx).pack(side="left")
-        ttk.Button(actions, text="Copia bozza mail", command=self._cmd_copy_email).pack(side="left", padx=4)
-        ttk.Button(actions, text="Apri cartella del giorno", command=self._open_selected_folder).pack(
-            side="left", padx=4
-        )
-        ttk.Button(actions, text="Riprocessa", command=self._reprocess_selected).pack(side="left", padx=4)
-        self.btn_hist_delete = ttk.Button(
-            actions,
-            text="Elimina transazione",
-            command=self._on_history_delete,
-        )
-        self.btn_hist_delete.pack(side="left", padx=4)
-        self.btn_hist_delete.state(["disabled"])
-        ttk.Button(actions, text="Timeline", command=self._show_timeline).pack(side="left", padx=4)
-        ttk.Button(actions, text="Esporta CSV", command=self._export_csv).pack(side="left", padx=4)
-        ttk.Button(actions, text="Importa storico dal log", command=self._import_log).pack(side="right")
+        del_hist_shortcut = QtGui.QShortcut(QtGui.QKeySequence(Qt.Key.Key_Delete), self.history_tree)
+        del_hist_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        del_hist_shortcut.activated.connect(self._on_history_delete)
+
+        self._history_menu = QtWidgets.QMenu(self.history_tree)
+        self._history_menu.addAction("Apri Word", self._open_selected_docx)
+        self._history_menu.addAction("Apri cartella", self._open_selected_folder)
+        self._history_menu.addAction("Riprocessa", self._reprocess_selected)
+        self._history_menu.addSeparator()
+        self._history_menu.addAction("Elimina completamente la transazione", self._on_history_delete)
+        layout.addWidget(self.history_tree, 1)
+
+        actions_vbox = QtWidgets.QVBoxLayout()
+        actions_vbox.setSpacing(6)
+
+        actions_row1 = QtWidgets.QHBoxLayout()
+        actions_row1.setSpacing(8)
+        btn_h_docx = _FluentButton("📄 Apri DOCX")
+        btn_h_docx.clicked.connect(self._open_selected_docx)
+        actions_row1.addWidget(btn_h_docx)
+
+        btn_h_folder = _FluentButton("📁 Apri cartella del giorno")
+        btn_h_folder.clicked.connect(self._open_selected_folder)
+        actions_row1.addWidget(btn_h_folder)
+
+        btn_h_mail = _FluentButton("✉️ Copia bozza mail")
+        btn_h_mail.clicked.connect(self._cmd_copy_email)
+        actions_row1.addWidget(btn_h_mail)
+
+        btn_h_timeline = _FluentButton("⏱️ Timeline")
+        btn_h_timeline.clicked.connect(self._show_timeline)
+        actions_row1.addWidget(btn_h_timeline)
+
+        btn_h_csv = _FluentButton("📊 Esporta CSV")
+        btn_h_csv.clicked.connect(self._export_csv)
+        actions_row1.addWidget(btn_h_csv)
+        actions_row1.addStretch(1)
+        actions_vbox.addLayout(actions_row1)
+
+        actions_row2 = QtWidgets.QHBoxLayout()
+        actions_row2.setSpacing(8)
+        btn_h_reproc = _FluentButton("🔄 Riprocessa")
+        btn_h_reproc.clicked.connect(self._reprocess_selected)
+        actions_row2.addWidget(btn_h_reproc)
+
+        self.btn_hist_delete = _FluentButton("Elimina transazione")
+        self.btn_hist_delete.setProperty("btnRole", "danger")
+        self.btn_hist_delete.setEnabled(False)
+        self.btn_hist_delete.clicked.connect(self._on_history_delete)
+        actions_row2.addWidget(self.btn_hist_delete)
+
+        actions_row2.addStretch(1)
+        btn_h_log = _FluentButton("📥 Importa storico dal log")
+        btn_h_log.clicked.connect(self._import_log)
+        actions_row2.addWidget(btn_h_log)
+        actions_vbox.addLayout(actions_row2)
+
+        layout.addLayout(actions_vbox)
 
     def _today(self) -> None:
         self.var_day.set(date.today().isoformat())
@@ -938,7 +2103,7 @@ class DashboardApp:
 
     def _shift_day(self, delta: int) -> None:
         try:
-            current = date.fromisoformat(self.var_day.get().strip())
+            current = date.fromisoformat(str(self.var_day.get()).strip())
         except ValueError:
             current = date.today()
         self.var_day.set((current + timedelta(days=delta)).isoformat())
@@ -946,15 +2111,18 @@ class DashboardApp:
         self._load_history()
 
     def _load_history(self) -> None:
-        status_value = dict(HISTORY_STATUS_FILTERS).get(self.var_status.get())
-        day = None if self.var_all_days.get() or self.var_from.get() or self.var_to.get() else self.var_day.get().strip()
+        status_value = dict(HISTORY_STATUS_FILTERS).get(str(self.var_status.get()))
+        day_str = str(self.var_day.get()).strip()
+        from_str = str(self.var_from.get()).strip()
+        to_str = str(self.var_to.get()).strip()
+        day = None if bool(self.var_all_days.get()) or from_str or to_str else day_str
         try:
             rows = self.registry.list_history(
                 day=day or None,
-                date_from=self.var_from.get().strip() or None,
-                date_to=self.var_to.get().strip() or None,
+                date_from=from_str or None,
+                date_to=to_str or None,
                 status=status_value,
-                text=self.var_text.get().strip() or None,
+                text=str(self.var_text.get()).strip() or None,
             )
             self._last_history_signature = self.registry.jobs_signature()
         except Exception as exc:
@@ -1018,12 +2186,14 @@ class DashboardApp:
             else:
                 self.btn_hist_delete.state(["disabled"])
 
-    def _on_history_right_click(self, event: Any) -> None:
-        row_id = self.history_tree.identify_row(event.y)
-        if row_id and not str(row_id).startswith("day:"):
-            self.history_tree.selection_set(row_id)
-            self._on_history_select()
-            self._history_menu.tk_popup(event.x_root, event.y_root)
+    def _on_history_context_menu(self, pos: QtCore.QPoint) -> None:
+        item = self.history_tree.itemAt(pos)
+        if item is not None:
+            iid = str(item.data(0, Qt.ItemDataRole.UserRole) or "")
+            if iid and not iid.startswith("day:"):
+                self.history_tree.selection_set(iid)
+                self._on_history_select()
+                self._history_menu.exec(self.history_tree.viewport().mapToGlobal(pos))
 
     def _on_history_delete(self) -> None:
         sid = self._selected_history_id()
@@ -1095,9 +2265,6 @@ class DashboardApp:
         self._load_history()
 
     def _on_toggle_incognito_quick(self) -> None:
-        from dataclasses import replace as _dc_replace
-        from modules.settings import apply_to_config, save_settings
-
         enabled = bool(self.incognito_var.get())
         updated = _dc_replace(
             self.settings,
@@ -1107,9 +2274,7 @@ class DashboardApp:
         self.settings = updated
         apply_to_config(updated)
         if ("detection", "incognito_mode") in self._setting_vars:
-            var = self._setting_vars[("detection", "incognito_mode")]
-            if hasattr(var, "set"):
-                var.set(enabled)
+            self._setting_vars[("detection", "incognito_mode")].set(enabled)
         if self._is_background_alive():
             self._send(
                 UiCommandType.TOGGLE_INCOGNITO.value,
@@ -1130,32 +2295,32 @@ class DashboardApp:
         session_id = self._selected_history_id() or self._selected_active
         if not session_id:
             return
-        tk, ttk = self.tk, self.ttk
         row = self._history_rows.get(session_id) or self._active_jobs.get(session_id) or {}
-        window = tk.Toplevel(self.root)
-        window.title(f"Timeline - {row.get('title') or session_id}")
-        window.geometry("620x420")
-        tree = ttk.Treeview(window, columns=("stage", "duration"), show="headings")
-        tree.heading("stage", text="Fase")
-        tree.heading("duration", text="Durata")
-        tree.column("stage", width=380)
-        tree.column("duration", width=160)
-        for stage, seconds in self.registry.stage_durations(session_id):
-            tree.insert("", "end", values=(_stage_label(stage), format_duration(seconds)))
-        tree.pack(fill="both", expand=True, padx=8, pady=8)
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"Timeline - {row.get('title') or session_id}")
+        dlg.resize(640, 440)
+        dlg_layout = QtWidgets.QVBoxLayout(dlg)
+        dlg_layout.setContentsMargins(12, 12, 12, 12)
+
+        tree = _FluentTreeWidget(show_tree_column=False, parent=dlg)
+        tree.configure_columns(("stage", "duration"), ("Fase", "Durata"), (400, 180))
+        for idx, (stage, seconds) in enumerate(self.registry.stage_durations(session_id)):
+            tree.insert("", "end", iid=f"step_{idx}", values=(_stage_label(stage), format_duration(seconds)))
+        dlg_layout.addWidget(tree, 1)
+
         if row.get("error"):
-            ttk.Label(window, text=f"Errore: {row.get('error')}", style="Warn.TLabel", wraplength=580).pack(
-                fill="x", padx=8, pady=(0, 8)
-            )
+            err_lbl = QtWidgets.QLabel(f"Errore: {row.get('error')}")
+            err_lbl.setProperty("labelRole", "warn")
+            err_lbl.setWordWrap(True)
+            dlg_layout.addWidget(err_lbl)
+        dlg.exec()
 
     def _export_csv(self) -> None:
-        from tkinter import filedialog
-
-        target = filedialog.asksaveasfilename(
-            parent=self.root,
-            defaultextension=".csv",
-            initialfile=f"storico_riunioni_{date.today().isoformat()}.csv",
-            filetypes=[("CSV", "*.csv")],
+        target, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Esporta CSV",
+            f"storico_riunioni_{date.today().isoformat()}.csv",
+            "CSV (*.csv)",
         )
         if not target:
             return
@@ -1175,106 +2340,142 @@ class DashboardApp:
             self.var_all_days.set(True)
             self._load_history()
 
-        _run_in_background(self.root, _work, _done)
+        _run_in_background(self, _work, _done)
 
     # ========================================================== impostazioni
     def _build_settings_tab(self) -> None:
-        tk, ttk = self.tk, self.ttk
-        outer = self.tab_settings
-        canvas = tk.Canvas(outer, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
-        content = ttk.Frame(canvas)
-        content_id = canvas.create_window((0, 0), window=content, anchor="nw")
-        content.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(content_id, width=e.width))
-        canvas.configure(yscrollcommand=scrollbar.set)
-        canvas.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-        # La rotellina scorre le impostazioni solo quando il puntatore è sopra il modulo
-        canvas.bind(
-            "<Enter>",
-            lambda _e: canvas.bind_all(
-                "<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units")
-            ),
-        )
-        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        outer_layout = QtWidgets.QVBoxLayout(self.tab_settings)
+        outer_layout.setContentsMargins(6, 4, 6, 6)
+        outer_layout.setSpacing(6)
 
+        scroll = QtWidgets.QScrollArea(self.tab_settings)
+        scroll.setWidgetResizable(True)
+        scroll.viewport().setObjectName("settingsViewport")
+        content = QtWidgets.QWidget()
+        content.setObjectName("settingsScrollContent")
+        content_layout = QtWidgets.QVBoxLayout(content)
+        content_layout.setContentsMargins(8, 4, 8, 8)
+        content_layout.setSpacing(8)
+
+        self._help_labels.clear()
         settings = self.settings
         for group_field in fields(settings):
             group_name = group_field.name
             group = getattr(settings, group_name)
-            box = ttk.LabelFrame(content, text=SETTINGS_GROUP_LABELS.get(group_name, group_name), padding=8)
-            box.pack(fill="x", padx=4, pady=4)
-            box.columnconfigure(2, weight=1)
+            box = QtWidgets.QGroupBox(SETTINGS_GROUP_LABELS.get(group_name, group_name))
+            grid = QtWidgets.QGridLayout(box)
+            grid.setContentsMargins(10, 8, 10, 8)
+            grid.setHorizontalSpacing(14)
+            grid.setVerticalSpacing(6)
+            grid.setColumnStretch(2, 1)
+
             for row_index, item in enumerate(fields(group)):
                 spec = dict(item.metadata)
-                label = str(spec.get("label", item.name))
-                restart = bool(spec.get("restart"))
-                ttk.Label(box, text=label + (" (riavvio)" if restart else "")).grid(
-                    row=row_index, column=0, sticky="w", padx=(0, 12), pady=2
-                )
+                label_text = str(spec.get("label", item.name)) + (" (riavvio)" if spec.get("restart") else "")
+                lbl_field = QtWidgets.QLabel(label_text)
+                grid.addWidget(lbl_field, row_index, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+
                 value = getattr(group, item.name)
                 key = (group_name, item.name)
+
                 if group_name == "output" and item.name == "glossary":
-                    text = tk.Text(box, width=44, height=3, font=("Segoe UI", 9))
-                    text.insert("1.0", str(value))
-                    text.grid(row=row_index, column=1, sticky="w", pady=2)
-                    self._glossary_text = text
-                    help_text = spec.get("help")
-                    if help_text:
-                        ttk.Label(
-                            box,
-                            text=str(help_text),
-                            foreground="#555555",
-                            wraplength=480,
-                            justify="left",
-                        ).grid(row=row_index, column=2, sticky="w", padx=(12, 4), pady=2)
-                    continue
-                if isinstance(value, bool):
-                    var: Any = tk.BooleanVar(value=value)
-                    ttk.Checkbutton(box, variable=var).grid(row=row_index, column=1, sticky="w")
+                    glossary_edit = _GlossaryEdit()
+                    glossary_edit.setFixedHeight(52)
+                    glossary_edit.setMinimumWidth(260)
+                    glossary_edit.setPlainText(str(value))
+                    grid.addWidget(glossary_edit, row_index, 1, Qt.AlignmentFlag.AlignLeft)
+                    self._glossary_text = glossary_edit
+                elif isinstance(value, bool):
+                    var = _ReactiveVar(value)
+                    chk = var.bind_CheckBox(QtWidgets.QCheckBox())
+                    grid.addWidget(chk, row_index, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    self._setting_vars[key] = var
                 elif group_name == "ollama" and item.name == "model":
-                    var = tk.StringVar(value=str(value))
-                    frame_model = ttk.Frame(box)
-                    frame_model.grid(row=row_index, column=1, sticky="w", pady=2)
-                    combo = ttk.Combobox(frame_model, textvariable=var, width=28)
-                    combo.pack(side="left")
+                    var = _ReactiveVar(str(value))
+                    model_wrap = QtWidgets.QWidget()
+                    model_row = QtWidgets.QHBoxLayout(model_wrap)
+                    model_row.setContentsMargins(0, 0, 0, 0)
+                    model_row.setSpacing(6)
+                    combo = QtWidgets.QComboBox()
+                    combo.setEditable(True)
+                    combo.setMinimumWidth(185)
+                    combo.setMinimumHeight(26)
+                    combo.addItem(str(value))
+                    var.bind_ComboBox(combo)
                     self._model_combo = combo
-                    ttk.Button(frame_model, text="Aggiorna elenco", command=self._refresh_models).pack(
-                        side="left", padx=(6, 0)
-                    )
+                    btn_refresh_models = _FluentButton("Aggiorna elenco")
+                    btn_refresh_models.clicked.connect(lambda: self._refresh_models(silent=False))
+                    model_row.addWidget(combo)
+                    model_row.addWidget(btn_refresh_models)
+                    grid.addWidget(model_wrap, row_index, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    self._setting_vars[key] = var
                 elif spec.get("choices"):
-                    var = tk.StringVar(value=str(value))
-                    ttk.Combobox(
-                        box, textvariable=var, values=list(spec["choices"]), state="readonly", width=24
-                    ).grid(row=row_index, column=1, sticky="w")
+                    var = _ReactiveVar(str(value))
+                    combo = QtWidgets.QComboBox()
+                    combo.setMinimumWidth(175)
+                    combo.setMinimumHeight(26)
+                    combo.addItems([str(c) for c in spec["choices"]])
+                    var.bind_ComboBox(combo)
+                    grid.addWidget(combo, row_index, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    self._setting_vars[key] = var
                 else:
-                    var = tk.StringVar(value=str(value))
-                    ttk.Entry(box, textvariable=var, width=44 if isinstance(value, str) else 14).grid(
-                        row=row_index, column=1, sticky="w"
-                    )
+                    var = _ReactiveVar(str(value))
+                    edit = var.bind_LineEdit(QtWidgets.QLineEdit())
+                    edit.setMinimumWidth(260 if isinstance(value, str) else 100)
+                    edit.setMinimumHeight(26)
+                    grid.addWidget(edit, row_index, 1, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                    self._setting_vars[key] = var
+
                 help_text = spec.get("help")
                 if help_text:
-                    ttk.Label(
-                        box,
-                        text=str(help_text),
-                        foreground="#555555",
-                        wraplength=480,
-                        justify="left",
-                    ).grid(row=row_index, column=2, sticky="w", padx=(12, 4), pady=2)
-                self._setting_vars[key] = var
+                    lbl_help = QtWidgets.QLabel(str(help_text))
+                    lbl_help.setProperty("labelRole", "help")
+                    lbl_help.setWordWrap(True)
+                    lbl_help.setContentsMargins(0, 1, 0, 1)
+                    grid.addWidget(lbl_help, row_index, 2, Qt.AlignmentFlag.AlignVCenter)
+                    self._help_labels.append(lbl_help)
 
-        bar = ttk.Frame(content)
-        bar.pack(fill="x", padx=4, pady=8)
-        ttk.Button(bar, text="Salva", command=self._save_settings).pack(side="left")
-        ttk.Button(bar, text="Ripristina default", command=self._restore_defaults).pack(side="left", padx=4)
-        ttk.Button(bar, text="Test Ollama", command=self._test_ollama).pack(side="left", padx=(20, 4))
-        ttk.Button(bar, text="Verifica GPU", command=self._check_gpu).pack(side="left", padx=4)
-        ttk.Button(bar, text="Crea icona sul Desktop", command=self._cmd_create_desktop_shortcut).pack(side="left", padx=4)
-        ttk.Label(bar, text="I campi marcati (riavvio) hanno effetto al prossimo avvio dell'applicazione.").pack(
-            side="left", padx=12
+            content_layout.addWidget(box)
+
+        content_layout.addStretch(1)
+        scroll.setWidget(content)
+        outer_layout.addWidget(scroll, 1)
+
+        bar = QtWidgets.QHBoxLayout()
+        bar.setContentsMargins(6, 4, 6, 4)
+        bar.setSpacing(8)
+        btn_save = _FluentButton("💾 Salva")
+        btn_save.setProperty("btnRole", "primary")
+        btn_save.clicked.connect(self._save_settings)
+        bar.addWidget(btn_save)
+
+        btn_defaults = _FluentButton("Ripristina default")
+        btn_defaults.clicked.connect(self._restore_defaults)
+        bar.addWidget(btn_defaults)
+
+        btn_test_ollama = _FluentButton("🔌 Test Ollama")
+        btn_test_ollama.clicked.connect(self._test_ollama)
+        bar.addWidget(btn_test_ollama)
+
+        btn_gpu = _FluentButton("🖥️ Verifica GPU")
+        btn_gpu.clicked.connect(self._check_gpu)
+        bar.addWidget(btn_gpu)
+
+        btn_shortcut = _FluentButton("📌 Crea icona sul Desktop")
+        btn_shortcut.clicked.connect(self._cmd_create_desktop_shortcut)
+        bar.addWidget(btn_shortcut)
+        bar.addStretch(1)
+
+        lbl_restart_note = QtWidgets.QLabel(
+            "I campi marcati (riavvio) hanno effetto al prossimo avvio dell'applicazione."
         )
-        self._refresh_models(silent=True)
+        lbl_restart_note.setProperty("labelRole", "help")
+        bar.addWidget(lbl_restart_note)
+        outer_layout.addLayout(bar)
+
+    def rendered_help_texts(self) -> list[str]:
+        """Restituisce i testi di aiuto effettivamente renderizzati nella scheda Impostazioni."""
+        return [lbl.text() for lbl in self._help_labels if lbl.text()]
 
     def _collect_settings_payload(self) -> dict[str, object]:
         payload: dict[str, object] = {}
@@ -1319,12 +2520,9 @@ class DashboardApp:
         self._info("Impostazioni", message)
 
     def _restore_defaults(self) -> None:
-        from tkinter import messagebox
-
-        if messagebox.askyesno(
+        if self._confirm(
             "Ripristina default",
             "Ripristinare i valori predefiniti nel modulo? (premere Salva per confermarli)",
-            parent=self.root,
         ):
             self._apply_settings_to_form(default_settings())
 
@@ -1339,11 +2537,16 @@ class DashboardApp:
 
         def _done(result: object) -> None:
             if isinstance(result, list) and self._model_combo is not None:
-                self._model_combo.configure(values=result)
+                current_text = self._model_combo.currentText()
+                self._model_combo.blockSignals(True)
+                self._model_combo.clear()
+                self._model_combo.addItems([str(m) for m in result])
+                self._model_combo.setEditText(current_text)
+                self._model_combo.blockSignals(False)
             elif not silent:
                 self._error("Ollama", f"Ollama non raggiungibile su {url}.")
 
-        _run_in_background(self.root, lambda: _fetch_ollama_models(url, timeout=3.0), _done)
+        _run_in_background(self, lambda: _fetch_ollama_models(url, timeout=3.0), _done)
 
     def _test_ollama(self) -> None:
         from bootstrap import _fetch_ollama_models, _is_model_available
@@ -1363,7 +2566,7 @@ class DashboardApp:
                 f"Modello {model}: {'presente' if present else 'NON installato (ollama pull ' + model + ')'}.",
             )
 
-        _run_in_background(self.root, lambda: _fetch_ollama_models(url, timeout=3.0), _done)
+        _run_in_background(self, lambda: _fetch_ollama_models(url, timeout=3.0), _done)
 
     def _check_gpu(self) -> None:
         from bootstrap import probe_ollama_gpu
@@ -1389,13 +2592,18 @@ class DashboardApp:
                 text += f"\n\n{hint}"
             self._info("Verifica GPU", text)
 
-        _run_in_background(self.root, lambda: probe_ollama_gpu(url, model), _done)
+        _run_in_background(self, lambda: probe_ollama_gpu(url, model), _done)
 
     # ================================================================ utility
     def _confirm(self, title: str, message: str) -> bool:
-        from tkinter import messagebox
-
-        return bool(messagebox.askyesno(title, message, parent=self.root))
+        ans = QtWidgets.QMessageBox.question(
+            self,
+            title,
+            message,
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        return ans == QtWidgets.QMessageBox.StandardButton.Yes
 
     def _cmd_create_desktop_shortcut(self) -> None:
         try:
@@ -1406,33 +2614,287 @@ class DashboardApp:
         except Exception as exc:
             self._error("Collegamento Desktop", f"Impossibile creare il collegamento sul Desktop: {exc}")
 
-    def _info(self, title: str, message: str) -> None:
-        from tkinter import messagebox
+    # ============================================== aggiornamenti e riavvio
+    def _dismiss_update_banner(self) -> None:
+        self._update_banner_dismissed = True
+        if hasattr(self, "update_banner"):
+            self.update_banner.setVisible(False)
 
-        messagebox.showinfo(title, message, parent=self.root)
+    def _cmd_check_updates(self) -> None:
+        self._update_banner_dismissed = False
+        self._check_updates(silent=False)
+
+    def _check_updates(self, *, silent: bool = False) -> None:
+        if self._checking_updates or self._installing_update:
+            return
+        self._checking_updates = True
+        if hasattr(self, "btn_check_updates"):
+            self.btn_check_updates.setEnabled(False)
+            self.btn_check_updates.setText("⏳ Verifica...")
+
+        def _work() -> UpdateInfo:
+            return check_for_updates(current_version=APP_VERSION)
+
+        def _done(result: object) -> None:
+            self._checking_updates = False
+            if hasattr(self, "btn_check_updates"):
+                self.btn_check_updates.setEnabled(True)
+                self.btn_check_updates.setText("🔄 Verifica aggiornamenti")
+            if isinstance(result, UpdateInfo):
+                self._apply_update_info(result, show_up_to_date_dialog=not silent)
+            elif not silent:
+                self._error("Verifica aggiornamenti", f"Errore imprevisto: {result}")
+
+        _run_in_background(self, _work, _done)
+
+    def _apply_update_info(self, info: UpdateInfo, *, show_up_to_date_dialog: bool = False) -> None:
+        self._update_info = info
+        if info.error is None:
+            try:
+                self.registry.set_meta("update_info", json.dumps(info.to_dict(), ensure_ascii=False))
+            except Exception as exc:
+                logger.debug("Salvataggio update_info su SQLite non riuscito: %s", exc)
+
+        if self._update_installed_version:
+            return
+
+        if info.update_available:
+            self.var_version.set(f"Versione: v{APP_VERSION} (disponibile v{info.latest_version})")
+            self.var_update_banner.set(
+                f"⬆️ Nuova versione disponibile su GitHub: v{info.latest_version} "
+                f"(versione installata: v{info.current_version})"
+            )
+            self.update_progress_bar.setVisible(False)
+            self.btn_release_notes.setVisible(True)
+            self.btn_install_update.setVisible(True)
+            self.btn_install_update.setEnabled(True)
+            self.btn_restart_after_update.setVisible(False)
+            if not self._update_banner_dismissed:
+                self.update_banner.setVisible(True)
+
+            if show_up_to_date_dialog:
+                notes_preview = (info.release_notes or "").strip()
+                if len(notes_preview) > 400:
+                    notes_preview = notes_preview[:400].rstrip() + "..."
+                msg = (
+                    f"È disponibile una nuova versione di {APP_NAME}: v{info.latest_version}\n"
+                    f"Versione attualmente in uso: v{info.current_version}"
+                )
+                if notes_preview:
+                    msg += f"\n\nNovità principali:\n{notes_preview}"
+                msg += "\n\nVuoi scaricare e installare subito l'aggiornamento?"
+                if self._confirm("Aggiornamento Disponibile", msg):
+                    self._cmd_install_update()
+        else:
+            self.var_version.set(f"Versione: v{APP_VERSION}")
+            self.update_banner.setVisible(False)
+            if show_up_to_date_dialog:
+                if info.error:
+                    self._error(
+                        "Verifica aggiornamenti",
+                        f"Impossibile verificare la presenza di aggiornamenti su GitHub:\n{info.error}",
+                    )
+                else:
+                    self._info(
+                        "Verifica aggiornamenti",
+                        f"Stai già utilizzando l'ultima versione disponibile ({APP_NAME} v{APP_VERSION}).",
+                    )
+
+    def _show_release_notes(self) -> None:
+        info = self._update_info
+        ver = info.latest_version if info is not None else APP_VERSION
+        notes = (info.release_notes if info is not None else "").strip()
+        if not notes:
+            changelog_file = PROJECT_ROOT / "CHANGELOG.md"
+            if changelog_file.is_file():
+                try:
+                    raw_cl = changelog_file.read_text(encoding="utf-8")
+                    notes = extract_changelog_section(raw_cl, ver) or raw_cl
+                except OSError:
+                    notes = ""
+        if not notes:
+            notes = f"Note di rilascio per la versione v{ver} non disponibili."
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle(f"Note di Rilascio - {APP_NAME} v{ver}")
+        dlg.resize(620, 420)
+        vbox = QtWidgets.QVBoxLayout(dlg)
+        vbox.setContentsMargins(12, 12, 12, 12)
+        vbox.setSpacing(8)
+
+        header_lbl = QtWidgets.QLabel(f"Novità della versione v{ver} (versione corrente: v{APP_VERSION})")
+        header_lbl.setProperty("labelRole", "updateTitle")
+        vbox.addWidget(header_lbl)
+
+        txt = QtWidgets.QPlainTextEdit(dlg)
+        txt.setReadOnly(True)
+        txt.setPlainText(notes)
+        vbox.addWidget(txt, 1)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        if info is not None and info.update_available and not self._update_installed_version:
+            btn_dl = _FluentButton("⬇️ Scarica e installa ora")
+            btn_dl.setProperty("btnRole", "primary")
+
+            def _accept_and_install() -> None:
+                dlg.accept()
+                self._cmd_install_update()
+
+            btn_dl.clicked.connect(_accept_and_install)
+            btn_row.addWidget(btn_dl)
+
+        btn_close = _FluentButton("Chiudi")
+        btn_close.clicked.connect(dlg.close)
+        btn_row.addWidget(btn_close)
+        vbox.addLayout(btn_row)
+        dlg.exec()
+
+    def _on_update_progress(self, pct: int, msg: str) -> None:
+        if hasattr(self, "update_progress_bar"):
+            self.update_progress_bar.setVisible(True)
+            self.update_progress_bar.setValue(max(0, min(100, int(pct))))
+        if hasattr(self, "var_update_banner") and msg:
+            self.var_update_banner.set(f"⏳ {msg} ({pct}%)")
+
+    def _cmd_install_update(self) -> None:
+        info = self._update_info
+        if info is None or not info.update_available or self._installing_update:
+            return
+        self._installing_update = True
+        self._update_banner_dismissed = False
+        self.update_banner.setVisible(True)
+        self.btn_install_update.setEnabled(False)
+        if hasattr(self, "btn_check_updates"):
+            self.btn_check_updates.setEnabled(False)
+        self.update_progress_bar.setValue(0)
+        self.update_progress_bar.setVisible(True)
+        self.var_update_banner.set(f"⏳ Avvio download di {APP_NAME} v{info.latest_version}...")
+
+        def _progress_cb(pct: int, msg: str) -> None:
+            try:
+                self._bg_bridge.progress.emit(self._on_update_progress, pct, msg)
+            except RuntimeError:
+                pass
+
+        def _work() -> UpdateResult:
+            return download_and_apply_update(
+                info,
+                project_root=PROJECT_ROOT,
+                progress_callback=_progress_cb,
+            )
+
+        def _done(result: object) -> None:
+            self._installing_update = False
+            if hasattr(self, "btn_check_updates"):
+                self.btn_check_updates.setEnabled(True)
+
+            if isinstance(result, UpdateResult) and result.success:
+                self._update_installed_version = result.installed_version
+                self.update_progress_bar.setVisible(False)
+                self.btn_install_update.setVisible(False)
+                self.btn_restart_after_update.setVisible(True)
+                self.btn_restart_after_update.setEnabled(True)
+                self.var_update_banner.set(
+                    f"✅ Aggiornamento a {APP_NAME} v{result.installed_version} installato con successo! "
+                    "Clicca 'Riavvia ora' per applicare la nuova versione."
+                )
+                self.var_version.set(
+                    f"Versione: v{APP_VERSION} → v{result.installed_version} (riavvio richiesto)"
+                )
+                try:
+                    self.registry.set_meta("update_info", "")
+                except Exception:
+                    pass
+                if self._confirm(
+                    "Aggiornamento Completato",
+                    f"{result.message}\n\n"
+                    f"Vuoi riavviare {APP_NAME} adesso per attivare subito la versione v{result.installed_version}?",
+                ):
+                    self._cmd_restart_app(skip_confirm=True)
+            else:
+                self.update_progress_bar.setVisible(False)
+                self.btn_install_update.setEnabled(True)
+                err_msg = result.message if isinstance(result, UpdateResult) else str(result)
+                self.var_update_banner.set(
+                    f"⚠️ Aggiornamento a v{info.latest_version} non riuscito. Riprova."
+                )
+                self._error("Errore aggiornamento", err_msg)
+
+        _run_in_background(self, _work, _done)
+
+    def _has_active_recording(self) -> bool:
+        for job in self._active_jobs.values():
+            st = str(job.get("status") or "").lower()
+            stg = str(job.get("stage") or "").lower()
+            if st in ("recording", "paused") or stg in (
+                Stage.RECORDING.value,
+                Stage.RECORDING_AND_TRANSCRIBING.value,
+                Stage.PAUSED.value,
+                Stage.GRACE_PERIOD.value,
+            ):
+                return True
+        return False
+
+    def _cmd_restart_app(self, *, skip_confirm: bool = False) -> None:
+        if self._has_active_recording():
+            if not self._confirm(
+                "Registrazione in corso",
+                "Attenzione: c'è una registrazione di chiamata attualmente attiva.\n\n"
+                "Se riavvii ora, la registrazione verrà interrotta e la sessione verrà "
+                "recuperata automaticamente al riavvio.\n\n"
+                "Vuoi procedere comunque con il riavvio?",
+            ):
+                return
+        elif not skip_confirm:
+            if not self._confirm(
+                "Riavvia applicazione",
+                f"Vuoi riavviare {APP_NAME} (servizio in background e Cruscotto)?",
+            ):
+                return
+
+        if hasattr(self, "btn_restart_app"):
+            self.btn_restart_app.setEnabled(False)
+            self.btn_restart_app.setText("⏳ Riavvio...")
+        if hasattr(self, "btn_restart_after_update"):
+            self.btn_restart_after_update.setEnabled(False)
+        if hasattr(self, "_timer"):
+            self._timer.stop()
+
+        def _work() -> bool:
+            stop_background_instance(self.registry, timeout_sec=6.0)
+            spawn_restarted_processes(
+                project_root=PROJECT_ROOT,
+                start_background=True,
+                reopen_dashboard=True,
+                delay_sec=1.0,
+            )
+            return True
+
+        def _done(_result: object) -> None:
+            self.close()
+            qapp = QtWidgets.QApplication.instance()
+            if qapp is not None:
+                qapp.quit()
+
+        _run_in_background(self, _work, _done)
+
+    def _info(self, title: str, message: str) -> None:
+        QtWidgets.QMessageBox.information(self, title, message)
 
     def _error(self, title: str, message: str) -> None:
-        from tkinter import messagebox
-
-        messagebox.showerror(title, message, parent=self.root)
+        QtWidgets.QMessageBox.critical(self, title, message)
 
 
 def run_dashboard(initial_tab: str | None = None) -> int:
-    """Entry point di `main.py --dashboard`: istanza singola, nessun processo audio coinvolto."""
-    try:
-        import tkinter as tk
-    except ImportError:
-        sys.stderr.write(
-            "Il cruscotto richiede tkinter, assente in questa installazione di Python.\n"
-            "Reinstallare Python da python.org includendo l'opzione 'tcl/tk and IDLE'.\n"
-        )
-        return EXIT_MISSING_DEPENDENCY
-
+    """Entry point di `main.py --dashboard`: istanza singola PySide6, nessun processo audio coinvolto."""
     if sys.platform == "win32":
         try:
             import ctypes
 
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(f"{APP_NAME}.MeetingScribe.{APP_VERSION}")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                f"{APP_NAME}.MeetingScribe.{APP_VERSION}"
+            )
         except Exception:
             pass
 
@@ -1441,29 +2903,24 @@ def run_dashboard(initial_tab: str | None = None) -> int:
         focus_window_by_title(DASHBOARD_TITLE)
         return EXIT_SUCCESS
     try:
-        registry = JobRegistry()
-        root = tk.Tk()
+        qapp = _ensure_qt_app()
+        qapp.setApplicationName(APP_NAME)
+        qapp.setApplicationVersion(APP_VERSION)
         if APP_ICON_PATH.exists():
-            try:
-                root.iconbitmap(default=str(APP_ICON_PATH))
-                root.iconbitmap(str(APP_ICON_PATH))
-            except Exception:
-                pass
-        logo_png = APP_ICON_PATH.parent / "logo_64.png"
-        if logo_png.exists():
-            try:
-                photo = tk.PhotoImage(file=str(logo_png))
-                root.iconphoto(True, photo)
-            except Exception:
-                pass
-        try:
-            root.iconname(APP_NAME)
-        except tk.TclError:
-            pass
-        DashboardApp(root, registry, initial_tab=initial_tab)
-        root.title(f"{DASHBOARD_TITLE}")
-        root.mainloop()
+            qapp.setWindowIcon(QtGui.QIcon(str(APP_ICON_PATH)))
+
+        registry = JobRegistry()
+        window = DashboardApp(None, registry, initial_tab=initial_tab)
+        window.setWindowTitle(DASHBOARD_TITLE)
+        window.show()
+        qapp.exec()
         logger.info("Cruscotto %s v%s chiuso.", APP_NAME, APP_VERSION)
         return EXIT_SUCCESS
+    except ImportError:
+        sys.stderr.write(
+            "Il cruscotto richiede PySide6, assente in questa installazione di Python.\n"
+            "Eseguire: pip install PySide6-Essentials\n"
+        )
+        return EXIT_MISSING_DEPENDENCY
     finally:
         instance.release()

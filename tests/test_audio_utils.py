@@ -6,7 +6,6 @@ from pathlib import Path
 import pytest
 
 from modules.audio_utils import (
-    WavFileInfo,
     build_ffmpeg_normalize_command,
     calculate_missing_frames,
     compute_silence_injection_frames,

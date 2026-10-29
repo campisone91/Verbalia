@@ -15,7 +15,7 @@ except ImportError:  # pragma: no cover
     pystray = None
 
 from config import APP_NAME, ASSETS_DIR, LOG_DIR, OUTPUT_DIR
-from modules.contracts import Stage, StageUpdate, UiCommandType, now_tz
+from modules.contracts import STAGE_LABELS_IT, Stage, StageUpdate, UiCommandType, now_tz
 from modules.logging_setup import get_logger, sanitize_for_log
 
 STAGE_COLORS: dict[Stage, dict[str, str]] = {
@@ -101,28 +101,6 @@ STAGE_COLORS: dict[Stage, dict[str, str]] = {
         "fill": "#424242",
         "border": "#212121",
     },
-}
-
-STAGE_LABELS_IT: dict[Stage, str] = {
-    Stage.BOOTSTRAPPING: "Inizializzazione ambiente",
-    Stage.IDLE: "In attesa di call Teams",
-    Stage.START_DEBOUNCE: "Verifica avvio call Teams",
-    Stage.RECORDING: "Registrazione in corso",
-    Stage.RECORDING_AND_TRANSCRIBING: "Registrazione + Trascrizione",
-    Stage.PAUSED: "Registrazione in Pausa",
-    Stage.GRACE_PERIOD: "Pausa temporanea (Grace Period)",
-    Stage.FINALIZING_AUDIO: "Finalizzazione tracce audio",
-    Stage.QUEUED: "In coda di elaborazione",
-    Stage.TRANSCRIBING_FINAL: "Trascrizione finale in corso",
-    Stage.RELEASING_WHISPER: "Rilascio risorse Whisper",
-    Stage.SUMMARIZING_MAP: "Sintesi blocchi (Fase MAP)",
-    Stage.SUMMARIZING_REDUCE: "Sintesi verbale e mail (Fase REDUCE)",
-    Stage.BUILDING_DOCX: "Generazione documento Word",
-    Stage.VERIFYING_DOCX: "Verifica documento Word",
-    Stage.CLEANING_UP: "Pulizia file temporanei",
-    Stage.COMPLETED: "Elaborazione completata",
-    Stage.ERROR: "Errore applicativo",
-    Stage.SHUTTING_DOWN: "Chiusura in corso",
 }
 
 
@@ -330,6 +308,7 @@ class StageMonitorTray:
         self._processing_total: int | None = None
         self._queue_count: int = 0
         self._shutting_down: bool = False
+        self._available_update_version: str | None = None
 
         self._output_dir: Path = (
             output_dir if output_dir is not None else OUTPUT_DIR
@@ -566,6 +545,11 @@ class StageMonitorTray:
                 "Apri Cruscotto",
                 self._on_open_dashboard_item,
                 default=True,
+            ),
+            pystray.MenuItem(
+                lambda _item: f"⬆️ Aggiornamento disponibile (v{self._available_update_version})",
+                self._on_open_dashboard_item,
+                visible=lambda _item: bool(self._available_update_version),
             ),
             pystray.MenuItem(
                 "Modalità in incognito (Zero Popup)",
@@ -815,6 +799,23 @@ class StageMonitorTray:
     def is_incognito_mode(self) -> bool:
         with self._lock:
             return self._incognito_mode
+
+    def set_available_update(self, latest_version: str | None) -> None:
+        """Imposta o rimuove l'indicazione di una nuova versione disponibile nel menu della Tray."""
+        with self._lock:
+            cleaned = str(latest_version or "").strip().lstrip("vV")
+            self._available_update_version = cleaned if cleaned else None
+            icon = self._icon
+        if icon is not None and hasattr(icon, "update_menu"):
+            try:
+                icon.update_menu()
+            except Exception as exc:
+                self._logger.debug("Aggiornamento menu update ignorato: %s", exc)
+
+    @property
+    def available_update_version(self) -> str | None:
+        with self._lock:
+            return self._available_update_version
 
     def notify(self, title: str, message: str) -> None:
         """Mostra una notifica desktop tramite la System Tray se supportata."""

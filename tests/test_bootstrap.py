@@ -148,6 +148,7 @@ def test_headless_stream_safety() -> None:
     """Verifica che bootstrap funzioni in sicurezza anche quando sys.stdout e sys.stderr sono None (pythonw)."""
     import subprocess
     import sys
+
     from config import PROJECT_ROOT
 
     cmd = [

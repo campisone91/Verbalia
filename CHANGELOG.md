@@ -5,6 +5,30 @@ Tutte le modifiche rilevanti a questo progetto sono documentate in questo file.
 Il formato è basato su [Keep a Changelog](https://keepachangelog.com/it/1.1.0/),
 e questo progetto aderisce al [Semantic Versioning](https://semver.org/lang/it/).
 
+## [1.1.0] - 2026-10-29
+
+### Added
+- **Aggiornamento automatico e su richiesta da Cruscotto**:
+  - Verifica automatica della presenza di nuovi rilasci su GitHub all'avvio e pulsante manuale `"🔄 Verifica aggiornamenti"`.
+  - Fallback intelligente a feed Atom (`tags.atom`) e `raw.githubusercontent.com` con download release ZIP per aggirare in modo trasparente i limiti HTTP 403 (rate limiting) delle API GitHub su reti aziendali.
+  - Download streaming protetto con indicatore di progresso, verifica ZipSlip, protezione integrale dei dati utente (`settings.json`, `data/history.db`, `output/`, `temp/`, log e note personali `ROADMAP_*.md`).
+  - Backup preventivo e rollback automatico in caso di errore durante l'aggiornamento.
+  - Sincronizzazione automatica delle dipendenze `pip` al cambio di `requirements.txt`.
+  - Riavvio coordinato multi-processo (servizio background + cruscotto) direttamente dal frontend con salvaguardia delle registrazioni in corso.
+- **Badge versione nel Cruscotto**:
+  - Visualizzazione testuale in tempo reale della versione corrente del software nel footer della finestra (`Versione: v1.1.0`) e badge dinamico nella System Tray quando è disponibile un aggiornamento.
+- **Apertura automatica Cruscotto all'avvio**:
+  - Al doppio click sull'icona desktop (`Verbalia.lnk` / `Verbalia.vbs`) a programma chiuso, oltre ad avviare il servizio in background e la tray, viene aperto immediatamente il Cruscotto Grafico.
+- **Pausa e Ripresa Registrazione**:
+  - Supporto pausa/ripresa sia da System Tray che da Cruscotto Grafico e tramite hotkey globale di sistema (default `Ctrl+Alt+P`), con tracciamento temporale dei periodi di pausa e calcolo esatto della durata netta parlata.
+- **Import File Audio/Video**:
+  - Scheda dedicata nel cruscotto per importare registrazioni pregresse (`.mp3`, `.wav`, `.m4a`, `.mp4`, `.mkv`), estrazione automatica traccia audio via FFmpeg e pipeline completa di trascrizione e verbalizzazione.
+- **Diarizzazione Parlanti su traccia altri interlocutori**:
+  - Etichettatura automatica degli speaker remoti (`[ALTRI - Speaker 1]`, `[ALTRI - Speaker 2]`) preservando l'identificazione certa dell'utente locale (`[TU]`).
+
+### Changed
+- Migrazione completa dell'interfaccia utente a **PySide6 (Qt for Python)** con tema Windows 11 Fluent Design (supporto Light & Dark mode, toggle di stato, accordion per sezioni avanzate e layout responsive).
+
 ## [1.0.2] - 2026-10-29
 
 ### Added

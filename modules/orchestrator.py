@@ -13,7 +13,7 @@ import time
 from collections.abc import Callable
 from datetime import timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 
 from bootstrap import (
     _fetch_ollama_models,
@@ -128,7 +128,6 @@ from modules.settings import (
     to_summarizer_options,
 )
 from modules.state_manager import get_state_manager, is_session_locked, release_state_manager
-from modules.summarizer import OllamaMapReduceSummarizer
 from modules.transcriber import RollingTranscriber, WhisperEngine
 from modules.transcript_utils import (
     format_chunk_transcript,
@@ -560,6 +559,7 @@ class MeetingScribeApplication:
         self.controller = RecordingController(self)
         self._shutdown_reason: ShutdownReason = ShutdownReason.USER_REQUEST
         self._services_started = False
+        self._latest_update_info: dict[str, object] | None = None
 
         try:
             migrate_flat_output_to_daily(self.output_dir)
@@ -625,6 +625,7 @@ class MeetingScribeApplication:
     def toggle_incognito_mode(self, enabled: bool | None = None) -> bool:
         """Attiva o disattiva la modalità in incognito e salva l'impostazione su disco."""
         from dataclasses import replace as _dc_replace
+
         from modules.settings import save_settings
 
         target = (not self.settings.detection.incognito_mode) if enabled is None else bool(enabled)
@@ -657,10 +658,12 @@ class MeetingScribeApplication:
         self.bus.publish(StageEvent(kind=EVENT_NOTIFY, detail=message, fields={"title": title}))
 
     def launch_dashboard(self, tab: str | None = None) -> None:
-        """Avvia il cruscotto Tkinter in un processo separato (istanza singola gestita dal cruscotto)."""
+        """Avvia il cruscotto grafico in un processo separato (istanza singola gestita dal cruscotto)."""
         command = [sys.executable, str(PROJECT_ROOT / "main.py"), "--dashboard"]
         if tab:
             command += ["--tab", tab]
+        dash_env = dict(os.environ)
+        dash_env["TEAMS_SCRIBE_SKIP_BOOTSTRAP"] = "1"
         subprocess.Popen(
             command,
             cwd=str(PROJECT_ROOT),
@@ -669,6 +672,7 @@ class MeetingScribeApplication:
             stderr=subprocess.DEVNULL,
             creationflags=windows_creation_flags(),
             close_fds=True,
+            env=dash_env,
         )
 
     def _summarizer_for(self, runtime: SessionRuntime) -> SummarizerLike:
@@ -683,6 +687,8 @@ class MeetingScribeApplication:
             if hasattr(summarizer, "set_progress_callback"):
                 summarizer.set_progress_callback(runtime.reporter.progress_tokens)
             return summarizer
+        from modules.summarizer import OllamaMapReduceSummarizer
+
         ollama = runtime.settings.ollama
         return OllamaMapReduceSummarizer(
             base_url=ollama.base_url,
@@ -1277,18 +1283,54 @@ class MeetingScribeApplication:
             self.reload_settings()
             if self.live is None:
                 self.apply_watcher_settings()
+        elif command == UiCommandType.CHECK_UPDATES.value:
+            self.check_updates_async(notify_if_available=True)
         elif command == UiCommandType.EXIT.value:
             self.request_shutdown(ShutdownReason.USER_REQUEST)
+
+    def check_updates_async(self, *, notify_if_available: bool = True) -> threading.Thread:
+        """Avvia in background il controllo di nuove versioni su GitHub e aggiorna tray e registro."""
+
+        def _worker() -> None:
+            from modules.updater import check_for_updates
+
+            try:
+                info = check_for_updates(current_version=APP_VERSION)
+                info_dict = info.to_dict()
+                self._latest_update_info = info_dict
+                if self.registry is not None:
+                    try:
+                        self.registry.set_meta("update_info", json.dumps(info_dict, ensure_ascii=False))
+                    except Exception as exc:
+                        self.logger.debug("Salvataggio update_info su SQLite non riuscito: %s", exc)
+                self.tray.set_available_update(info.latest_version if info.update_available else None)
+                self._publish_app_status()
+                if info.update_available and notify_if_available:
+                    self._notify(
+                        "Aggiornamento Disponibile",
+                        f"È disponibile {APP_NAME} v{info.latest_version} (attuale v{info.current_version}). "
+                        "Apri il Cruscotto per installarlo.",
+                    )
+            except Exception as exc:
+                self.logger.debug("Controllo aggiornamenti in background non riuscito: %s", exc)
+
+        t = threading.Thread(target=_worker, name="GitHubUpdateChecker", daemon=True)
+        t.start()
+        return t
 
     def _publish_app_status(self) -> None:
         live = self.live
         worker = self.worker
+        upd = self._latest_update_info or {}
         self._publish(
             StageEvent(
                 kind=EVENT_STATUS,
                 fields={
                     "heartbeat": now_tz().isoformat(),
                     "pid": os.getpid(),
+                    "app_version": APP_VERSION,
+                    "update_available": bool(upd.get("update_available", False)),
+                    "latest_version": upd.get("latest_version") or APP_VERSION,
                     "queue_length": len(self.processing_queue),
                     "processing_session": worker.current_session_id if worker is not None else None,
                     "live_session": live.session_id if live is not None else None,
@@ -1324,6 +1366,24 @@ class MeetingScribeApplication:
         self._recover_pending_sessions()
         self.worker = self._make_worker()
         self.worker.start()
+
+        # Apertura automatica del Cruscotto al doppio click da chiuso (se non disabilitata o headless)
+        if (
+            not self.headless
+            and os.environ.get("TEAMS_SCRIBE_HEADLESS_TRAY") != "1"
+            and os.environ.get("VERBALIA_NO_INITIAL_DASHBOARD") != "1"
+            and "PYTEST_CURRENT_TEST" not in os.environ
+        ):
+            try:
+                self.launch_dashboard()
+            except Exception as exc:
+                self.logger.warning("Apertura automatica cruscotto all'avvio non riuscita: %s", exc)
+
+        if (
+            getattr(self.settings.execution, "auto_check_updates", True)
+            and "PYTEST_CURRENT_TEST" not in os.environ
+        ):
+            self.check_updates_async(notify_if_available=True)
 
         hotkey_listener: GlobalHotkeyListener | None = None
         import config as _cfg

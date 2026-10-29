@@ -246,10 +246,11 @@ def test_queue_badge_icon_and_dashboard_helpers(tmp_path: Path) -> None:
 
 
 _DASHBOARD_PROBE = r'''
-import json, sys
+import json, os, sys
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import bootstrap
 bootstrap._fetch_ollama_models = lambda *_a, **_kw: ["llama3.1:8b"]
-import tkinter as tk
+from PySide6 import QtWidgets
 from modules.dashboard_ui import DashboardApp
 from modules.job_registry import JobRegistry
 
@@ -257,16 +258,11 @@ registry = JobRegistry()
 registry.upsert_job("S1", title="Call A", status="processing", stage="summarizing_map")
 registry.update_stage("S1", "summarizing_map", "MAP 1/2", 1, 2)
 registry.upsert_job("S2", title="Vecchia", status="completed", processing_ended_at="2020-01-01T00:00:00+00:00")
-try:
-    root = tk.Tk()
-except tk.TclError:
-    print(json.dumps({"skip": True}))
-    sys.exit(0)
-root.withdraw()
-app = DashboardApp(root, registry, initial_tab="impostazioni")
+
+app = DashboardApp(None, registry, initial_tab="impostazioni")
 app._info = lambda *args, **kwargs: None
 app._confirm = lambda *args, **kwargs: True
-root.update()
+QtWidgets.QApplication.processEvents()
 result = {"active": list(app.active_tree.get_children())}
 app._selected_active = "S1"
 app._refresh_detail()
@@ -284,17 +280,17 @@ result["history"] = sorted(app._history_rows)
 result["has_detail_level"] = ("ollama", "detail_level") in app._setting_vars
 result["has_recap_email_setting"] = ("output", "generate_recap_email") in app._setting_vars
 result["map_block"] = str(app._collect_settings_payload()["ollama"]["map_block_duration_sec"])
-for _ in range(10):
-    root.update()
-root.destroy()
+QtWidgets.QApplication.processEvents()
+app.close()
 print(json.dumps(result))
 '''
 
 
 def test_dashboard_window_builds_and_sends_commands(tmp_path: Path) -> None:
-    """Il cruscotto gira in un processo dedicato (come in produzione): Tk resta su un solo thread."""
-    pytest.importorskip("tkinter")
+    """Il cruscotto PySide6 gira in un processo dedicato e invia correttamente i comandi tramite SQLite."""
+    pytest.importorskip("PySide6")
     env = dict(os.environ)
+    env["QT_QPA_PLATFORM"] = "offscreen"
     env["TEAMS_SCRIBE_DATA_DIR"] = str(tmp_path / "data")
     env["TEAMS_SCRIBE_SETTINGS_PATH"] = str(tmp_path / "settings.json")
     env["TEAMS_SCRIBE_LOG_DIR"] = str(tmp_path / "logs")
@@ -328,7 +324,12 @@ def test_dashboard_window_builds_and_sends_commands(tmp_path: Path) -> None:
 def test_worker_and_processor_cancellation(tmp_path: Path) -> None:
     """Verifica la cancellazione del job in coda e l'interruzione del processore."""
     from modules.contracts import JobCancelledError
-    from modules.processing import ProcessingJob, ProcessingQueue, ProcessingWorker, SessionProcessor
+    from modules.processing import (
+        ProcessingJob,
+        ProcessingQueue,
+        ProcessingWorker,
+        SessionProcessor,
+    )
 
     queue = ProcessingQueue()
     job = ProcessingJob(session_id="S_TEST_CANCEL", session_dir=tmp_path / "s_test")

@@ -7,9 +7,22 @@ from typing import Final
 
 # 8.1 Metadati
 APP_NAME: str = "Verbalia"
-APP_VERSION: str = "1.0.2"
+APP_VERSION: str = "1.1.0"
 STATE_SCHEMA_VERSION: int = 1
 MIN_PYTHON_VERSION: tuple[int, int] = (3, 10)
+
+# 8.1b Repository GitHub e Aggiornamenti
+GITHUB_REPO_OWNER: Final[str] = "campisone91"
+GITHUB_REPO_NAME: Final[str] = "Verbalia"
+GITHUB_REPO_SLUG: Final[str] = f"{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}"
+GITHUB_REPO_URL: Final[str] = f"https://github.com/{GITHUB_REPO_SLUG}"
+GITHUB_API_LATEST_RELEASE_URL: Final[str] = (
+    f"https://api.github.com/repos/{GITHUB_REPO_SLUG}/releases/latest"
+)
+GITHUB_API_TAGS_URL: Final[str] = f"https://api.github.com/repos/{GITHUB_REPO_SLUG}/tags"
+UPDATE_CHECK_TIMEOUT_SEC: Final[float] = 6.0
+UPDATE_DOWNLOAD_TIMEOUT_SEC: Final[int] = 120
+AUTO_CHECK_UPDATES_DEFAULT: bool = True
 
 # Exit codes (Sezione 29.1)
 EXIT_SUCCESS: int = 0

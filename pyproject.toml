@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "verbalia"
-version = "1.0.2"
+version = "1.1.0"
 description = "Applicazione desktop locale Windows per registrazione dual-track, trascrizione faster-whisper e verbalizzazione Ollama di call Microsoft Teams."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,6 +38,7 @@ dependencies = [
     "pystray>=0.19.5,<1.0.0",
     "Pillow>=10.0.0,<13.0.0",
     "onnxruntime>=1.17.0",
+    "PySide6-Essentials>=6.6.0,<7.0.0",
 ]
 
 [project.optional-dependencies]

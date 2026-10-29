@@ -12,13 +12,24 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 import zipfile
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    pass
+
+
+def __getattr__(name: str) -> object:
+    if name == "urllib":
+
+        mod = importlib.import_module("urllib")
+        globals()["urllib"] = mod
+        return mod
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 APP_NAME: str = "Verbalia"
-APP_VERSION: str = "1.0.2"
+APP_VERSION: str = "1.1.0"
 STATE_SCHEMA_VERSION: int = 1
 MIN_PYTHON_VERSION: tuple[int, int] = (3, 10)
 
@@ -79,6 +90,7 @@ REQUIRED_IMPORTS: dict[str, str] = {
     "pystray": "pystray",
     "PIL": "Pillow",
     "onnxruntime": "onnxruntime",
+    "PySide6": "PySide6-Essentials",
 }
 
 REQUIRED_MARKER_KEYS: frozenset[str] = frozenset(
@@ -360,6 +372,8 @@ def _download_and_install_ffmpeg(local_target: Path) -> tuple[Path, str]:
     temp_binary = target_dir / "ffmpeg.exe.tmp"
 
     try:
+        import urllib.request
+
         digest = hashlib.sha256()
         request = urllib.request.Request(
             FFMPEG_DOWNLOAD_URL,
@@ -497,6 +511,9 @@ def resolve_ffmpeg(bin_dir: Path | None = None) -> tuple[Path, str]:
 
 def _fetch_ollama_models(base_url: str, timeout: float = 5.0) -> list[str] | None:
     """Interroga GET /api/tags su Ollama e restituisce i nomi dei modelli installati."""
+    import urllib.error
+    import urllib.request
+
     url = f"{base_url.rstrip('/')}/api/tags"
     request = urllib.request.Request(url, method="GET")
     try:
@@ -618,6 +635,9 @@ def probe_ollama_gpu(
         "models": [],
         "hint": "",
     }
+    import urllib.error
+    import urllib.request
+
     url = f"{base_url.rstrip('/')}/api/ps"
     request = urllib.request.Request(url, method="GET")
     try:
@@ -664,8 +684,19 @@ def probe_ollama_gpu(
     return result
 
 
+def is_gui_available() -> bool:
+    """Verifica che PySide6 sia importabile per il cruscotto grafico (--dashboard)."""
+    try:
+        spec = importlib.util.find_spec("PySide6")
+    except (ImportError, ValueError):
+        return False
+    return spec is not None
+
+
 def is_tkinter_available() -> bool:
-    """Verifica che tkinter sia importabile (necessario per il cruscotto --dashboard)."""
+    """Alias mantenuto per retrocompatibilità diagnostica: verifica disponibilità GUI (PySide6 o tkinter)."""
+    if is_gui_available():
+        return True
     try:
         spec = importlib.util.find_spec("tkinter")
     except (ImportError, ValueError):
@@ -718,6 +749,8 @@ def install_ollama_silently(temp_dir: Path | None = None) -> str:
     installer_path = work_dir / "OllamaSetup.exe"
 
     try:
+        import urllib.request
+
         request = urllib.request.Request(
             OLLAMA_DOWNLOAD_URL,
             headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
@@ -969,6 +1002,10 @@ def ensure_environment(
     _ensure_directories()
 
     if os.environ.get("TEAMS_SCRIBE_SKIP_BOOTSTRAP") == "1":
+        return
+
+    # Fast-path immediato per l'apertura del solo Cruscotto GUI: non bloccare su check FFmpeg/Ollama
+    if not is_setup_only and "--dashboard" in sys.argv:
         return
 
     # 5. Calcolo hash requirements.txt

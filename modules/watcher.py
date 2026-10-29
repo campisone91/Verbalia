@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import ctypes
 import dataclasses
-from enum import Enum
 import math
 import re
 import threading
 import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta
+from enum import Enum
 
 try:
     import psutil

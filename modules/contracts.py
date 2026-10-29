@@ -38,6 +38,29 @@ class Stage(str, Enum):
     SHUTTING_DOWN = "shutting_down"
 
 
+STAGE_LABELS_IT: dict[Stage, str] = {
+    Stage.BOOTSTRAPPING: "Inizializzazione ambiente",
+    Stage.IDLE: "In attesa di call Teams",
+    Stage.START_DEBOUNCE: "Verifica avvio call Teams",
+    Stage.RECORDING: "Registrazione in corso",
+    Stage.RECORDING_AND_TRANSCRIBING: "Registrazione + Trascrizione",
+    Stage.PAUSED: "Registrazione in Pausa",
+    Stage.GRACE_PERIOD: "Pausa temporanea (Grace Period)",
+    Stage.FINALIZING_AUDIO: "Finalizzazione tracce audio",
+    Stage.QUEUED: "In coda di elaborazione",
+    Stage.TRANSCRIBING_FINAL: "Trascrizione finale in corso",
+    Stage.RELEASING_WHISPER: "Rilascio risorse Whisper",
+    Stage.SUMMARIZING_MAP: "Sintesi blocchi (Fase MAP)",
+    Stage.SUMMARIZING_REDUCE: "Sintesi verbale e mail (Fase REDUCE)",
+    Stage.BUILDING_DOCX: "Generazione documento Word",
+    Stage.VERIFYING_DOCX: "Verifica documento Word",
+    Stage.CLEANING_UP: "Pulizia file temporanei",
+    Stage.COMPLETED: "Elaborazione completata",
+    Stage.ERROR: "Errore applicativo",
+    Stage.SHUTTING_DOWN: "Chiusura in corso",
+}
+
+
 # 9.2 ChunkStatus
 class ChunkStatus(str, Enum):
     OPEN = "open"
@@ -93,6 +116,7 @@ class UiCommandType(str, Enum):
     RESUME_RECORDING = "resume_recording"
     TOGGLE_PAUSE = "toggle_pause"
     IMPORT_AUDIO = "import_audio"
+    CHECK_UPDATES = "check_updates"
     EXIT = "exit"
 
 

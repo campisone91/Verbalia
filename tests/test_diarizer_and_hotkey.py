@@ -19,7 +19,6 @@ from modules.contracts import (
 )
 from modules.diarizer import (
     AudioFeatureExtractor,
-    OnnxSpeakerEmbedder,
     SessionSpeakerTracker,
 )
 from modules.hotkey import (

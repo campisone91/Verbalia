@@ -7,7 +7,13 @@ import config
 from modules.contracts import Stage
 from modules.job_registry import JobRegistry
 from modules.orchestrator import purge_session_files
-from modules.settings import AppSettings, DetectionSettings, apply_to_config, load_settings, save_settings
+from modules.settings import (
+    AppSettings,
+    DetectionSettings,
+    apply_to_config,
+    load_settings,
+    save_settings,
+)
 from modules.tray_ui import StageMonitorTray
 
 

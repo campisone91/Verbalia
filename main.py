@@ -27,12 +27,17 @@ from modules.contracts import (  # noqa: E402
     ScribeError,
     StateValidationError,
 )
-from modules.orchestrator import MeetingScribeApplication  # noqa: E402
 from modules.single_instance import (  # noqa: E402
     APP_MUTEX_NAME,
     SingleInstance,
     show_message_box,
 )
+
+
+def _create_app(**kwargs: object):
+    from modules.orchestrator import MeetingScribeApplication
+
+    return MeetingScribeApplication(**kwargs)  # type: ignore[arg-type]
 
 if sys.platform == "win32":
     try:
@@ -133,17 +138,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def _acquire_app_instance(incognito_active: bool = False) -> SingleInstance | None:
-    """Una sola istanza registrante per volta: due watcher registrerebbero la stessa call."""
+    """Una sola istanza registrante per volta: se già attiva, apre direttamente il Cruscotto."""
     instance = SingleInstance(APP_MUTEX_NAME)
     if instance.acquire():
         return instance
     message = (
         f"{APP_NAME} è già in esecuzione (icona nella System Tray). "
-        "Usare il menu della tray o il cruscotto per controllarlo."
+        "Apertura del cruscotto..."
     )
     sys.stderr.write(message + "\n")
-    if not incognito_active and os.environ.get("TEAMS_SCRIBE_HEADLESS_TRAY") != "1":
-        show_message_box(APP_NAME, message)
+    if os.environ.get("TEAMS_SCRIBE_HEADLESS_TRAY") != "1":
+        try:
+            from modules.dashboard_ui import run_dashboard
+
+            run_dashboard()
+        except Exception:
+            if not incognito_active:
+                show_message_box(APP_NAME, message)
     return None
 
 
@@ -191,7 +202,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"Errore: la directory di sessione non esiste o non è valida: {resume_dir}\n"
             )
             return EXIT_INVALID_ARGS
-        app = MeetingScribeApplication()
+        app = _create_app()
         return app.run_resume(resume_dir)
 
     if args.test_pipeline is not None:
@@ -208,7 +219,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"Errore: il percorso indicato per --test-pipeline è una directory: {audio_path}\n"
             )
             return EXIT_INVALID_ARGS
-        app = MeetingScribeApplication()
+        app = _create_app()
         return app.run_test_pipeline(audio_path)
 
     if args.import_file is not None:
@@ -226,7 +237,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             return EXIT_INVALID_ARGS
         try:
-            app = MeetingScribeApplication(headless=True)
+            app = _create_app(headless=True)
             docx_path = app.run_import_pipeline(import_path, title=args.title)
             print(f"File importato ed elaborato con successo: {docx_path}")
             return EXIT_SUCCESS
@@ -235,11 +246,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             return EXIT_APP_ERROR
 
     if args.dry_run:
-        app = MeetingScribeApplication(headless=True)
+        app = _create_app(headless=True)
         return app.run_dry_run()
 
     if args.diagnostics:
-        app = MeetingScribeApplication(headless=True)
+        app = _create_app(headless=True)
         return app.run_diagnostics()
 
     if args.dashboard:
@@ -253,13 +264,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.record_now:
         try:
-            app = MeetingScribeApplication()
+            app = _create_app()
             return app.run_record_now()
         finally:
             instance.release()
 
     try:
-        app = MeetingScribeApplication()
+        app = _create_app()
         return app.run_auto()
     except BootstrapError:
         return EXIT_BOOTSTRAP_FAILED

@@ -22,6 +22,7 @@ from modules.contracts import (
     AudioDeviceError,
     AudioProcessingError,
     DeviceDescriptor,
+    SessionContext,
     replace_with_retry,
 )
 from modules.logging_setup import get_logger
@@ -809,7 +810,7 @@ def prepare_imported_audio_session(
     audio_work_dir.mkdir(parents=True, exist_ok=True)
     transcripts_dir.mkdir(parents=True, exist_ok=True)
 
-    owner_lock = acquire_session_owner_lock(session_dir)
+    acquire_session_owner_lock(session_dir)
     try:
         resolved_ffmpeg = ffmpeg_path or _resolve_default_ffmpeg_path()
         full_norm_wav = audio_work_dir / "imported_full_16k.wav"

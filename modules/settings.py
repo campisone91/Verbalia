@@ -447,6 +447,16 @@ class ExecutionSettings:
             ),
         ),
     )
+    auto_check_updates: bool = field(
+        default=_config.AUTO_CHECK_UPDATES_DEFAULT,
+        metadata=_spec(
+            "Verifica automaticamente aggiornamenti su GitHub all'avvio",
+            help_text=(
+                "Controlla in background all'avvio se è disponibile una nuova versione del software su GitHub "
+                "mostrando un avviso nel pannello. Disattivare solo in ambienti completamente disconnessi da Internet."
+            ),
+        ),
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -524,7 +534,10 @@ def default_settings() -> AppSettings:
             user_display_name=str(_config.USER_DISPLAY_NAME),
             glossary=str(_config.CUSTOM_GLOSSARY),
         ),
-        execution=ExecutionSettings(parallel_policy=str(_config.AI_PARALLEL_POLICY)),
+        execution=ExecutionSettings(
+            parallel_policy=str(_config.AI_PARALLEL_POLICY),
+            auto_check_updates=bool(getattr(_config, "AUTO_CHECK_UPDATES_DEFAULT", True)),
+        ),
     )
 
 
@@ -691,6 +704,7 @@ def apply_to_config(settings: AppSettings) -> None:
     _config.DIARIZATION_ENABLED_DEFAULT = bool(getattr(settings.whisper, "diarization_enabled", True))
     _config.DIARIZATION_MAX_SPEAKERS = int(getattr(settings.whisper, "diarization_max_speakers", 8))
     _config.DIARIZATION_SIMILARITY_THRESHOLD = float(getattr(settings.whisper, "diarization_similarity_threshold", 0.68))
+    _config.AUTO_CHECK_UPDATES_DEFAULT = bool(getattr(settings.execution, "auto_check_updates", True))
 
 
 def apply_settings(path: Path | None = None) -> AppSettings:

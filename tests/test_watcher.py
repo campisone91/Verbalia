@@ -9,7 +9,6 @@ import pytest
 from modules.contracts import MeetingMetadata, ShutdownReason, Stage
 from modules.watcher import (
     TeamsCallWatcher,
-    WatcherSnapshot,
     WatcherTransition,
     compute_confidence_score,
     fetch_outlook_meeting_metadata,

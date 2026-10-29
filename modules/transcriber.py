@@ -36,7 +36,6 @@ from modules.contracts import (
     TranscriptSegment,
     atomic_write_text,
 )
-from modules.diarizer import SessionSpeakerTracker
 from modules.logging_setup import get_logger, set_thread_log_session_id
 from modules.transcript_utils import (
     apply_custom_glossary_normalization,
@@ -46,6 +45,7 @@ from modules.transcript_utils import (
 )
 
 if TYPE_CHECKING:
+    from modules.diarizer import SessionSpeakerTracker
     from modules.state_manager import StateManager
 
 logger = get_logger("transcriber")
@@ -386,11 +386,12 @@ class RollingTranscriber:
         self._holder = _WhisperModelHolder(model_factory=model_factory)
         self._glossary: str = resolve_glossary(glossary)
         self._session_id: str | None = session_id
-        self._speaker_tracker: SessionSpeakerTracker | None = (
-            speaker_tracker
-            if speaker_tracker is not None
-            else SessionSpeakerTracker(session_dir=self._session_dir)
-        )
+        if speaker_tracker is not None:
+            self._speaker_tracker: SessionSpeakerTracker | None = speaker_tracker
+        else:
+            from modules.diarizer import SessionSpeakerTracker as _SpeakerTracker
+
+            self._speaker_tracker = _SpeakerTracker(session_dir=self._session_dir)
         self._beam_size: int = engine.beam_size if engine is not None else WHISPER_BEAM_SIZE
         self._language: str = engine.language if engine is not None else WHISPER_LANGUAGE
         self.priority: int = int(priority)
